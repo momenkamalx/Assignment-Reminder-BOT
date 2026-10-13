@@ -1,0 +1,25 @@
+# Dependencies and build
+node_modules/
+dist/
+coverage/
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# Database
+data/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+
+# WhatsApp authentication
+auth/
+auth_info/
+sessions/
+creds.json
+
+# Logs
+*.log

@@ -1,0 +1,73 @@
+# WhatsApp Assignment Reminder Bot — Stage 1
+
+A local Node.js + TypeScript prototype using SQLite, a mock WhatsApp adapter, and Vitest. No WhatsApp account, paid API, or cloud deployment is used.
+
+## Run locally
+
+Install Node.js 24 or later. In PowerShell inside this folder:
+
+```powershell
+npm install
+npm run build
+npm test
+npm run demo
+```
+
+The demo sends two mock leader announcements, prints their Arabic confirmation preview, simulates admin approval, and prints the upcoming assignments. It writes to `data/demo.sqlite`; repeating it creates new example announcements. No messages leave your computer. Use `npm run test:watch` while changing the code.
+
+To experiment, change the announcement in `src/demo.ts`, or create a test using `Bot.handle({ id, groupId, senderId, text, replyTo })`. Configure authorized group IDs, leaders, admins, and timezones through `Store.configureGroup`. A leader is not automatically an approver: add them to the admin list if desired. The mock adapter's `sent` array contains the outgoing IDs needed for `replyTo`.
+
+## Supported announcement format
+
+Separate assignments with blank lines, numbered entries, or explicit course headers:
+
+```text
+المادة: البرمجة
+عندنا واجب
+اسم التكليف: تمارين الدوال
+الوصف: حل الأسئلة
+تسليم: 2027-05-20 18:00
+SUST Moodle https://moodle.example.edu/task
+
+Course: Physics
+Assignment
+Name: Lab report
+Due: 2027-05-21 12:00
+Email: lecturer@example.edu
+```
+
+English keywords assignment/deadline/project/due/exercise/exercises and Arabic واجب/تسليم/مشروع/تمرين/تمارين are recognized. Sudanese phrases such as `عندنا واجب تسليم بكرة` or `عندنا تمرين` create a draft requiring a corrected deadline. Arabic numerals are supported in both dates and numbered assignment entries (`١.`, `٢.`, `٣.`), including messages without blank lines. Unrecognized submission URLs are classified as custom links. Extraction is rule based: explicit labels extract course, name and description; absent fields remain unknown. This is not unrestricted natural-language understanding. Ordinary unstructured chat is filtered conservatively; keyword-rich conversations may still require an admin rejection.
+
+Deadlines must contain exactly one `YYYY-MM-DD HH:mm` date and time per assignment. `Z` and `+HH:mm` offsets are accepted. Otherwise Africa/Khartoum is used (or the group's configured timezone); SQLite stores UTC. Relative dates, date-only values, invalid dates and multiple deadlines require correction. Past deadlines cannot be approved. Missing courses or names remain explicitly marked unknown and do not prevent approval.
+
+## Confirmation and commands
+
+The bot quotes the original leader message and asks `هل تريد تسجيل التكليفات؟`. Only configured admins replying to that specific preview in the same group can approve with `نعم`, `يس`, `yes`, or `y`; reject with `لا` or `no`.
+
+Before approval, reply to the current preview with:
+
+```text
+!edit 1 deadline=2027-05-20 18:00
+!edit 2 course=Physics
+!edit 1 name=Worksheet 2
+```
+
+Supported fields: course, name, description, deadline, submissionMethod, destination. Each edit sends a new preview and invalidates earlier previews. Approve the newest preview. `!list` lists upcoming assignments for the current group; `!help` explains commands. Editing/deleting registered assignments is deferred to Stage 3, including confirmation of deadline changes and cancellations.
+
+## Storage and reliability
+
+`src/database.ts` applies idempotent version-1 schema migration with a migration ledger. Groups, announcement IDs, pending drafts and assignments persist in SQLite. Foreign keys, unique constraints, `BEGIN IMMEDIATE` transactions and an in-process message queue prevent duplicate registration and partial approval. Approving or rejecting invalidates all confirmations tied to the announcement. Tests cover independent connections and restart recovery.
+
+The regression fixture in `tests/fixtures/sudanese-announcement.ts` contains one Sudanese Arabic message with three separately numbered subjects, distinct deadlines, and SUST Moodle/email/custom-link destinations. Tests verify every extracted field, correct preview quoting, exact-message admin approval, missing-deadline correction, replay and competing-approval protection, rollback after the second assignment fails to save, and isolation when two groups share an original message ID. Nothing is registered until every draft has a valid future deadline.
+
+Raw chat messages are not stored or logged. Only configured identities, announcement IDs and extracted assignment data are retained. Database files may contain personal identifiers and submission addresses; keep the data folder private. `.gitignore` excludes databases, `.env` and future authentication storage. `.env.example` documents configuration; the demo reads `DATABASE_PATH` from the process environment, not automatically from `.env` (Node's `--env-file` can load it). There are no WhatsApp credentials in Stage 1.
+
+The adapter contract is separate from parsing and business logic. Adapter failures reject the handler promise so callers can report errors and retry; the demo reports useful errors without dumping messages. Announcement preview delivery and database writes cannot be atomic across an external transport. Stage 2/3 must add delivery recovery/outbox behavior before using a real adapter, including interrupted previews and a committed approval whose success response fails.
+
+## Remaining stages
+
+Stage 2: Baileys connection, secure credentials and operational group configuration commands. Stage 3: reminders, retries, downtime recovery, confirmed changes/cancellations, and genuine mention-support investigation. No `@all` functionality is claimed or implemented. Stage 4: Oracle Cloud Always Free deployment, systemd, backups and operations documentation.
+
+Baileys is an unofficial WhatsApp integration. Future use may risk account restriction and must respect platform rules and group consent; no real connection exists here.
+
+SQLite uses Node's built-in `node:sqlite` API; Node 24 may print an experimental warning. See the [Node 24 SQLite documentation](https://nodejs.org/docs/latest-v24.x/api/sqlite.html) and [Vitest guide](https://vitest.dev/guide/) for upstream references.

@@ -1,0 +1,39 @@
+import { DateTime } from 'luxon';
+import type { Assignment } from './types.js';
+
+// Arabic uses Unicode letter boundaries; JavaScript \b only handles Latin word characters.
+const keyword = /\b(?:assignment|deadline|project|due|exercises?)\b|(?<![\p{L}\p{N}_])(?:و|ف|ب|ل)?(?:ال)?(?:واجب|تسليم|مشروع|تمرين|تمارين)(?![\p{L}\p{N}_])/iu;
+const digits = (text: string) => text.replace(/[٠-٩]/g, c => String('٠١٢٣٤٥٦٧٨٩'.indexOf(c)));
+
+export function parseDeadline(text: string, zone = 'Africa/Khartoum'): Pick<Assignment, 'deadline' | 'deadlineIssue'> {
+  const normalized = digits(text);
+  const matches = [...normalized.matchAll(/\b(\d{4}-\d{2}-\d{2})[ T]+(\d{2}:\d{2}(?::\d{2})?)(Z|[+-]\d{2}:\d{2})?/g)];
+  const dateCount = [...normalized.matchAll(/\b\d{4}-\d{2}-\d{2}\b/g)].length;
+  if (dateCount > 1 || /\b(?:am|pm)\b|صباحاً|مساءً/iu.test(normalized)) {
+    return { deadline: null, deadlineIssue: 'Ambiguous deadline: specify one date and a 24-hour time.' };
+  }
+  if (matches.length !== 1) return { deadline: null, deadlineIssue: matches.length > 1 ? 'Multiple deadlines: specify one deadline.' : 'Missing or ambiguous deadline: use YYYY-MM-DD HH:mm.' };
+  const m = matches[0]!;
+  const dt = DateTime.fromISO(`${m[1]}T${m[2]}${m[3] ?? ''}`, { zone, setZone: true });
+  return dt.isValid ? { deadline: dt.toUTC().toISO(), deadlineIssue: null } : { deadline: null, deadlineIssue: 'Invalid date, time or timezone.' };
+}
+
+/** Deterministic extraction: blank lines, numbered entries, or course headers delimit assignments. */
+export function extractAssignments(text: string, zone = 'Africa/Khartoum'): Assignment[] {
+  if (!keyword.test(text)) return [];
+  const blocks = text.trim().split(/\n\s*\n|\n(?=\s*[0-9٠-٩]+[.)]\s)|\n(?=\s*(?:course|subject|المادة|مادة)\s*[:：])/iu);
+  return blocks.filter(block => keyword.test(block) && (/\d{4}-\d{2}-\d{2}|deadline|\bdue\b|تسليم|(?:course|subject|المادة|مادة)\s*[:：]|(?:عندنا|عليكم|مطلوب)\s+(?:واجب|مشروع|تمرين|تمارين)|\b(?:complete|submit|solve)\s+(?:the\s+)?(?:assignment|project|exercises?)\b/iu.test(digits(block)))).map(block => {
+    const course = block.match(/(?:course|subject|المادة|مادة)\s*[:：]\s*([^\n;]+)/iu)?.[1]?.trim() ?? null;
+    const name = block.match(/(?:assignment name|name|اسم التكليف)\s*[:：]\s*([^\n;]+)/iu)?.[1]?.trim() ?? null;
+    const description = block.match(/(?:description|الوصف)\s*[:：]\s*([^\n]+)/iu)?.[1]?.trim() ?? null;
+    const url = block.match(/https?:\/\/[^\s<>]+/iu)?.[0]?.replace(/[،,.)]+$/, '') ?? null;
+    const email = block.match(/[\w.+-]+@[\w.-]+\.[a-z]{2,}/iu)?.[0] ?? null;
+    const custom = block.match(/(?:submission|التسليم)\s*[:：]\s*([^\n]+)/iu)?.[1]?.trim();
+    const submissionMethod = /moodle|مودل|موودل/iu.test(block) ? (/SUST|السودان للعلوم/iu.test(block) ? 'SUST Moodle' : 'Moodle')
+      : /forms\.gle|forms\.google|docs\.google\.com\/forms|google forms/iu.test(block) ? 'Google Forms'
+      : /drive\.google|google drive/iu.test(block) ? 'Google Drive'
+      : email || /email|إيميل|ايميل|البريد/iu.test(block) ? 'email'
+      : /in person|حضوري|باليد/iu.test(block) ? 'in person' : custom || url ? 'custom' : null;
+    return { course, name, description, ...parseDeadline(block, zone), submissionMethod, destination: email ?? url ?? custom ?? null };
+  });
+}
