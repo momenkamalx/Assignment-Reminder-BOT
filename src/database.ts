@@ -36,7 +36,9 @@ export class Store {
     return this.db.prepare('INSERT OR IGNORE INTO announcements(group_id,message_id) VALUES(?,?)').run(group, original).changes === 1;
   }
   addConfirmation(group: string, id: string, original: string, drafts: Assignment[]) {
-    this.db.prepare('INSERT INTO confirmations(group_id,message_id,original_id,drafts) VALUES(?,?,?,?)').run(group, id, original, JSON.stringify(drafts));
+    // The transport await can overlap approval/rejection through another connection.
+    // A single guarded write prevents a late preview from reopening a completed announcement.
+    return this.db.prepare("INSERT INTO confirmations(group_id,message_id,original_id,drafts) SELECT ?,?,?,? WHERE EXISTS(SELECT 1 FROM announcements WHERE group_id=? AND message_id=? AND status='pending')").run(group, id, original, JSON.stringify(drafts), group, original).changes === 1;
   }
   approve(group: string, confirmationId: string, now: string): 'saved' | 'stale' | 'invalid' {
     this.db.exec('BEGIN IMMEDIATE');

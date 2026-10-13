@@ -2,6 +2,8 @@
 
 A Node.js + TypeScript prototype using SQLite, a mock WhatsApp adapter, Vitest, an offline-tested Baileys integration, and persistent automatic reminders. No WhatsApp account was paired, no live messages were sent, and no paid API or cloud deployment was used. Live startup is disabled by default. See [Stage 2 setup](docs/stage-2.md) and [Stage 3 reminders and safe testing](docs/stage-3.md).
 
+Before Stage 4, read the [end-to-end integration results and readiness assessment](docs/integration-review.md). Run `npm test -- tests/end-to-end.test.ts` to repeat the complete mocked-event and temporary-database workflow without pairing an account.
+
 ## Run locally
 
 Install Node.js 24 or later. In PowerShell inside this folder:

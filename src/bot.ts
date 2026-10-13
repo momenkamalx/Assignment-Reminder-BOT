@@ -57,7 +57,8 @@ export class Bot {
         else Object.assign(drafts[index]!, { [field]: value });
         const newId = await this.adapter.send(m.groupId, preview(drafts, group.timezone), pending.original_id);
         this.store.db.prepare("UPDATE confirmations SET status='invalidated' WHERE group_id=? AND original_id=?").run(m.groupId, pending.original_id);
-        this.store.addConfirmation(m.groupId, newId, pending.original_id, drafts); return;
+        if (!this.store.addConfirmation(m.groupId, newId, pending.original_id, drafts)) await send('تم التعامل مع الإعلان بالفعل؛ هذه المعاينة لم تعد صالحة. استخدم !list للتحقق من التكليفات المسجلة.');
+        return;
       }
     }
     if (isAdmin && !m.replyTo && (text.startsWith('!edit ') || text.startsWith('!delete '))) {
@@ -76,13 +77,30 @@ export class Bot {
       if (!request || request.delivered || request.status !== 'pending') return;
       await send('تم استلام الطلب. انتظر رسالة التأكيد الخاصة بهذا التغيير ثم رد عليها بنعم أو لا.'); return;
     }
+    // A leader can propose an extension, but cannot bypass the separate admin confirmation.
+    if (!m.replyTo && m.senderId === group.leader && /تم\s+(?:تمديد|تأجيل)|(?:التسليم|الموعد)\s+(?:اتمدد|تمدد|اتأجل)|\bdeadline\s+(?:extended|extension)\b/iu.test(text)) {
+      if (this.store.db.prepare('SELECT message_id FROM assignment_changes WHERE group_id=? AND source_id=?').get(m.groupId, m.id)) return;
+      const normalized = text.replace(/[٠-٩]/g, c => String('٠١٢٣٤٥٦٧٨٩'.indexOf(c)));
+      const references = [...normalized.matchAll(/(?:التكليف|تكليف|assignment|الواجب|واجب|التمرين|تمرين|المشروع|مشروع)\s*#?\s*(\d+)/giu)];
+      const id = references.length === 1 ? Number(references[0]![1]) : NaN;
+      const saved = this.store.assignment(m.groupId, id);
+      if (!saved) { await send('حدد رقم تكليف واحد من !list، مثلاً: تم تمديد تسليم التكليف #12 إلى 2027-05-20 18:00.'); return; }
+      const deadline = parseDeadline(text, group.timezone);
+      if (!deadline.deadline || deadline.deadlineIssue || deadline.deadline <= this.now() || deadline.deadline <= saved.deadline) {
+        await send('حدد موعد تمديد واحداً بصيغة YYYY-MM-DD HH:mm، بعد الموعد الحالي وفي المستقبل.'); return;
+      }
+      const data: Assignment = { ...JSON.parse(saved.data) as Assignment, ...deadline };
+      const request = this.store.requestChange(m.groupId, m.id, id, 'update', data, this.now());
+      if (request && !request.delivered && request.status === 'pending') await send('تم استلام طلب التمديد. يجب أن يؤكده مسؤول بالرد على رسالة التأكيد الخاصة به.');
+      return;
+    }
     // Replies and commands are never treated as new leader announcements.
     if (m.replyTo || text.startsWith('!') || m.senderId !== group.leader) return;
     const drafts = extractAssignments(text, group.timezone);
     if (!drafts.length || !this.store.beginAnnouncement(m.groupId, m.id)) return;
     try {
       const id = await this.adapter.send(m.groupId, preview(drafts, group.timezone), m.id);
-      this.store.addConfirmation(m.groupId, id, m.id, drafts);
+      if (!this.store.addConfirmation(m.groupId, id, m.id, drafts)) await send('تم التعامل مع الإعلان بالفعل. استخدم !list للتحقق من التكليفات المسجلة.');
     } catch (error) {
       // No draft was created: allow the transport to retry this announcement.
       this.store.db.prepare("DELETE FROM announcements WHERE group_id=? AND message_id=? AND status='pending'").run(m.groupId, m.id);
