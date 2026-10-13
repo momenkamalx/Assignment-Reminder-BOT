@@ -1,6 +1,6 @@
-# WhatsApp Assignment Reminder Bot — Stages 1 and 2
+# WhatsApp Assignment Reminder Bot — Stages 1, 2 and 3
 
-A Node.js + TypeScript prototype using SQLite, a mock WhatsApp adapter, Vitest, and an offline-tested Baileys integration. No WhatsApp account was paired, no live messages were sent, and no paid API or cloud deployment was used. Live startup is disabled by default. See [Stage 2 setup and safe testing](docs/stage-2.md).
+A Node.js + TypeScript prototype using SQLite, a mock WhatsApp adapter, Vitest, an offline-tested Baileys integration, and persistent automatic reminders. No WhatsApp account was paired, no live messages were sent, and no paid API or cloud deployment was used. Live startup is disabled by default. See [Stage 2 setup](docs/stage-2.md) and [Stage 3 reminders and safe testing](docs/stage-3.md).
 
 ## Run locally
 
@@ -11,6 +11,7 @@ npm install
 npm run build
 npm test
 npm run demo
+npm run demo:reminders
 ```
 
 The demo sends two mock leader announcements, prints their Arabic confirmation preview, simulates admin approval, and prints the upcoming assignments. It writes to `data/demo.sqlite`; repeating it creates new example announcements. No messages leave your computer. Use `npm run test:watch` while changing the code.
@@ -52,7 +53,7 @@ Before approval, reply to the current preview with:
 !edit 1 name=Worksheet 2
 ```
 
-Supported fields: course, name, description, deadline, submissionMethod, destination. Each edit sends a new preview and invalidates earlier previews. Approve the newest preview. `!list` lists upcoming assignments for the current group; `!help` explains commands. Editing/deleting registered assignments is deferred to Stage 3, including confirmation of deadline changes and cancellations.
+Supported fields: course, name, description, deadline, submissionMethod, destination. Each draft edit sends a new preview and invalidates earlier previews. Approve the newest preview. `!list` lists upcoming assignments for the current group; `!help` explains commands. Saved assignment edits use an unquoted `!edit ID FIELD=VALUE`, and cancellations use `!delete ID`; each queues a separate admin confirmation. See the Stage 3 guide for reminder approval, settings and recovery behavior.
 
 ## Storage and reliability
 
@@ -62,11 +63,11 @@ The regression fixture in `tests/fixtures/sudanese-announcement.ts` contains one
 
 Raw chat messages are not stored or logged. Only configured identities, announcement IDs and extracted assignment data are retained. Database files may contain personal identifiers and submission addresses; keep the data folder private. `.gitignore` excludes databases, `.env` and future authentication storage. `.env.example` documents configuration; the demo reads `DATABASE_PATH` from the process environment, not automatically from `.env` (Node's `--env-file` can load it). There are no WhatsApp credentials in Stage 1.
 
-The adapter contract is separate from parsing and business logic. Adapter failures reject the handler promise so callers can report errors and retry; the demo reports useful errors without dumping messages. Announcement preview delivery and database writes cannot be atomic across an external transport. Stage 2/3 must add delivery recovery/outbox behavior before using a real adapter, including interrupted previews and a committed approval whose success response fails.
+The adapter contract is separate from parsing and business logic. Stage 3 adds persistent jobs and retries for reminders, late-registration permission prompts and saved-assignment change previews. The original leader-announcement preview and registration success acknowledgement still use the Stage 1 direct-send path; an interrupted preview or lost success response requires a replay or `!list` check. External transport and SQLite writes cannot be made atomic; the Stage 3 guide explains delivery uncertainty.
 
 ## Remaining stages
 
-Stage 2 provides the Baileys adapter, QR pairing entry point, external persistent credentials, reconnection handling and an explicit local group configuration file. A supervised real-account interoperability test remains pending. Stage 3: reminders, delivery retries, downtime recovery, confirmed changes/cancellations, and genuine mention-support investigation. No `@all` functionality is claimed or implemented. Stage 4: Oracle Cloud Always Free deployment, systemd, backups and operations documentation.
+Stages 2 and 3 provide the Baileys adapter, disabled QR pairing entry point, external credentials, explicit group configuration, persistent reminders, delivery retries, downtime recovery, confirmed changes/cancellations, and opt-in genuine mentions (disabled by default). Real-account interoperability and mention notification behavior remain untested. Stage 4 remains pending: Oracle Cloud Always Free deployment, systemd, backups and operations documentation.
 
 Baileys is an unofficial WhatsApp integration. Future use may risk account restriction and must respect platform rules and group consent; its live connection is disabled by default.
 

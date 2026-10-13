@@ -3,6 +3,7 @@
     "id": "120363000000000000@g.us",
     "leader": "249900000001@s.whatsapp.net",
     "admins": ["249900000002@s.whatsapp.net"],
-    "timezone": "Africa/Khartoum"
+    "timezone": "Africa/Khartoum",
+    "reminders": { "offsetHours": [24], "mentions": "none" }
   }
 ]

@@ -2,10 +2,10 @@ import { jidNormalizedUser, normalizeMessageContent, type WAMessage, type WASock
 import { Bot } from '../bot.js';
 import { extractAssignments } from '../parser.js';
 import type { Store } from '../database.js';
-import type { WhatsAppAdapter } from '../types.js';
+import type { WhatsAppAdapter, SendOptions } from '../types.js';
 import { isGroupId, type GroupConfig } from './config.js';
 
-export type Socket = Pick<WASocket, 'ev' | 'sendMessage' | 'end' | 'user'>;
+export type Socket = Pick<WASocket, 'ev' | 'sendMessage' | 'end' | 'user'> & Partial<Pick<WASocket, 'groupMetadata'>>;
 export class BaileysAdapter implements WhatsAppAdapter {
   private socket?: Socket;
   private connected = false;
@@ -47,7 +47,13 @@ export class BaileysAdapter implements WhatsAppAdapter {
       } finally { this.current.delete(cacheId); }
     }
   }
-  async send(groupId: string, text: string, replyTo?: string): Promise<string> {
+  async members(groupId: string): Promise<string[]> {
+    if (!this.authorized(groupId) || !this.connected || !this.socket?.groupMetadata) throw new Error('Authorized group member lookup unavailable.');
+    const metadata = await this.socket.groupMetadata(groupId);
+    if (metadata.id !== groupId) throw new Error('Group metadata identity mismatch.');
+    return metadata.participants.map(p => jidNormalizedUser(p.id)).filter(id => /^\d+@(s\.whatsapp\.net|lid)$/.test(id));
+  }
+  async send(groupId: string, text: string, replyTo?: string, options?: SendOptions): Promise<string> {
     if (!this.authorized(groupId)) throw new Error('Refusing delivery outside the authorized group allowlist.');
     if (!this.socket || !this.connected) throw new Error('WhatsApp transport is disconnected.');
     let quoted: WAMessage | undefined;
@@ -59,7 +65,7 @@ export class BaileysAdapter implements WhatsAppAdapter {
         quoted = { key: JSON.parse(row.key_json as string), message: { conversation: '' } };
       }
     }
-    const result = await this.socket.sendMessage(groupId, { text }, quoted ? { quoted } : {});
+    const result = await this.socket.sendMessage(groupId, { text, mentions: options?.mentions, mentionAll: options?.mentionAll }, { ...(quoted ? { quoted } : {}), ...(options?.messageId ? { messageId: options.messageId } : {}) });
     if (!result?.key.id) throw new Error('WhatsApp did not return a message ID.');
     return result.key.id;
   }

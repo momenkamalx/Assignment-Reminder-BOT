@@ -11,6 +11,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "demo": "tsx src/demo.ts",
+    "demo:reminders": "tsx src/demo-reminders.ts",
     "whatsapp": "tsx --env-file-if-exists=.env src/whatsapp/main.ts"
   },
   "dependencies": {

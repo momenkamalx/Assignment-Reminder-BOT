@@ -1,8 +1,10 @@
 import { DateTime } from 'luxon';
 import { jidNormalizedUser } from '@whiskeysockets/baileys';
 import type { Store } from '../database.js';
+import type { ReminderSettings } from '../types.js';
+import { validateSettings } from '../reminders/storage.js';
 
-export interface GroupConfig { id: string; leader: string; admins: string[]; timezone: string }
+export interface GroupConfig { id: string; leader: string; admins: string[]; timezone: string; reminders?: ReminderSettings }
 export const isGroupId = (id: string) => /^\d+(?:-\d+)?@g\.us$/.test(id);
 export function normalizePerson(value: string): string {
   const id = jidNormalizedUser(value);
@@ -20,14 +22,19 @@ export function parseGroups(input: unknown): GroupConfig[] {
     const timezone = typeof g.timezone === 'string' ? g.timezone : 'Africa/Khartoum';
     if (!DateTime.now().setZone(timezone).isValid) throw new Error('Invalid group timezone.');
     ids.add(g.id);
-    return { id: g.id, leader: normalizePerson(g.leader), admins: [...new Set(g.admins.map(a => normalizePerson(a as string)))], timezone };
+    const reminders = g.reminders as ReminderSettings | undefined;
+    if (reminders !== undefined) validateSettings(reminders);
+    return { id: g.id, leader: normalizePerson(g.leader), admins: [...new Set(g.admins.map(a => normalizePerson(a as string)))], timezone, ...(reminders ? { reminders } : {}) };
   });
 }
 /** The file is the complete allowlist, including removals. Validate before writing. */
 export function applyGroups(store: Store, groups: GroupConfig[]) {
   store.db.exec('BEGIN IMMEDIATE');
   try {
-    for (const group of groups) store.configureGroup(group.id, group.leader, group.admins, group.timezone);
+    for (const group of groups) {
+      store.configureGroup(group.id, group.leader, group.admins, group.timezone);
+      store.configureReminders(group.id, group.reminders ?? { offsetHours: [24], mentions: 'none' });
+    }
     store.db.exec('COMMIT');
   } catch (error) { store.db.exec('ROLLBACK'); throw error; }
 }

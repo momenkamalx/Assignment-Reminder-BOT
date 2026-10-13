@@ -22,7 +22,7 @@ export class Bot {
     const text = m.text.trim();
     const send = (content: string) => this.adapter.send(m.groupId, content, m.id);
     if (text === '!help') {
-      await send('!list: upcoming assignments. Reply to a preview: yes/نعم/y/يس, no/لا, or !edit NUMBER FIELD=VALUE. Fields: course, name, description, deadline, submissionMethod, destination. Saved assignment changes and !delete arrive in Stage 3.'); return;
+      await send('!list: upcoming assignments. Draft edits: reply !edit NUMBER FIELD=VALUE. Saved edits: !edit ID FIELD=VALUE; cancellation: !delete ID. Admin confirmation is required. Reply yes/نعم/y/يس or no/لا to the specific preview or immediate-reminder request.'); return;
     }
     if (text === '!list') {
       const rows = this.store.upcoming(m.groupId, this.now());
@@ -30,6 +30,16 @@ export class Bot {
     }
     const isAdmin = (JSON.parse(group.admins) as string[]).includes(m.senderId);
     if (m.replyTo && isAdmin) {
+      if (/^(نعم|يس|yes|y|لا|no)$/iu.test(text)) {
+        const approve = /^(نعم|يس|yes|y)$/iu.test(text);
+        const result = this.store.confirmChange(m.groupId, m.replyTo, approve, this.now());
+        if (result !== undefined) {
+          await send(result === 'saved' ? 'تم تأكيد التغيير بنجاح.' : result === 'busy' ? 'تذكير قيد الإرسال؛ أعد التأكيد بعد اكتماله.' : result === 'invalid' ? 'الموعد غير صالح؛ أرسل طلب تعديل جديد.' : result === 'rejected' ? 'تم رفض التغيير.' : 'هذا الطلب لم يعد صالحاً.'); return;
+        }
+        if (this.store.confirmImmediate(m.groupId, m.replyTo, approve, this.now())) {
+          await send(approve ? 'تمت الموافقة على التذكير الفوري.' : 'تم رفض التذكير الفوري.'); return;
+        }
+      }
       const pending = this.store.confirmation(m.groupId, m.replyTo);
       if (!pending) return;
       if (/^(نعم|يس|yes|y)$/iu.test(text)) {
@@ -49,6 +59,22 @@ export class Bot {
         this.store.db.prepare("UPDATE confirmations SET status='invalidated' WHERE group_id=? AND original_id=?").run(m.groupId, pending.original_id);
         this.store.addConfirmation(m.groupId, newId, pending.original_id, drafts); return;
       }
+    }
+    if (isAdmin && !m.replyTo && (text.startsWith('!edit ') || text.startsWith('!delete '))) {
+      const edit = text.match(/^!edit\s+(\d+)\s+(course|name|description|deadline|submissionMethod|destination)=(.+)$/s);
+      const cancel = text.match(/^!delete\s+(\d+)$/);
+      const id = Number(edit?.[1] ?? cancel?.[1]);
+      const saved = this.store.assignment(m.groupId, id);
+      if ((!edit && !cancel) || !saved) { await send('Use !edit ID FIELD=VALUE or !delete ID for an active assignment in this group.'); return; }
+      const data = JSON.parse(saved.data) as Assignment;
+      if (edit) {
+        if (edit[2] === 'deadline') Object.assign(data, parseDeadline(edit[3]!, group.timezone));
+        else Object.assign(data, { [edit[2]!]: edit[3]!.trim() });
+        if (!data.deadline || data.deadlineIssue || data.deadline <= this.now()) { await send('صحح الموعد: YYYY-MM-DD HH:mm ويجب أن يكون في المستقبل.'); return; }
+      }
+      const request = this.store.requestChange(m.groupId, m.id, id, cancel ? 'cancel' : 'update', data, this.now());
+      if (!request || request.delivered || request.status !== 'pending') return;
+      await send('تم استلام الطلب. انتظر رسالة التأكيد الخاصة بهذا التغيير ثم رد عليها بنعم أو لا.'); return;
     }
     // Replies and commands are never treated as new leader announcements.
     if (m.replyTo || text.startsWith('!') || m.senderId !== group.leader) return;

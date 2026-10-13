@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { DisconnectReason, initAuthCreds, type WAMessage, type BaileysEventMap, type AuthenticationState } from '@whiskeysockets/baileys';
+import { DisconnectReason, initAuthCreds, generateWAMessageContent, type MessageContentGenerationOptions, type WAMessage, type BaileysEventMap, type AuthenticationState } from '@whiskeysockets/baileys';
 import { Store } from '../src/database.js';
 import { BaileysAdapter, type Socket } from '../src/whatsapp/adapter.js';
 import { applyGroups, parseGroups } from '../src/whatsapp/config.js';
@@ -41,6 +41,27 @@ afterEach(() => { store.close(); vi.useRealTimers(); });
 const receive = (messages: WAMessage[], type: 'notify' | 'append' = 'notify') => adapter.receive({ messages, type });
 
 describe('Baileys transport boundary', () => {
+  it('passes native and individual mention metadata and stable message IDs through the transport', async () => {
+    await adapter.send(group, 'hello', undefined, { messageId: 'PERSISTENT', mentionAll: true });
+    expect(socket.sendMessage.mock.calls[0]).toEqual([group, { text: 'hello', mentions: undefined, mentionAll: true }, { messageId: 'PERSISTENT' }]);
+    await adapter.send(group, 'hello @249111', undefined, { mentions: ['249111@s.whatsapp.net'] });
+    expect(socket.sendMessage.mock.calls[1]![1]).toMatchObject({ mentions: ['249111@s.whatsapp.net'], mentionAll: undefined });
+  });
+  it('uses native mentionAll metadata; plain @all has no broadcast mention metadata', async () => {
+    const native = await generateWAMessageContent({ text: 'hello', mentionAll: true }, {} as MessageContentGenerationOptions);
+    const plain = await generateWAMessageContent({ text: '@all' }, {} as MessageContentGenerationOptions);
+    const individual = await generateWAMessageContent({ text: '@249111', mentions: ['249111@s.whatsapp.net'] }, {} as MessageContentGenerationOptions);
+    expect(native.extendedTextMessage!.contextInfo!.nonJidMentions).toBe(1);
+    expect(plain.extendedTextMessage?.contextInfo?.nonJidMentions ?? 0).toBe(0);
+    expect(individual.extendedTextMessage!.contextInfo!.mentionedJid).toEqual(['249111@s.whatsapp.net']);
+  });
+  it('looks up participant JIDs only for the requested authorized group', async () => {
+    const metadata = vi.fn(async (id: string) => ({ id, participants: [{ id: '249111:7@s.whatsapp.net' }, { id: '666@lid' }] }));
+    adapter.attach({ ...socket.asSocket(), groupMetadata: metadata } as unknown as Socket, true);
+    expect(await adapter.members(group)).toEqual(['249111@s.whatsapp.net', '666@lid']);
+    await expect(adapter.members('120363999999999999@g.us')).rejects.toThrow('unavailable');
+    expect(metadata).toHaveBeenCalledTimes(1);
+  });
   it('feeds a three-assignment announcement and exact quoted admin approval into the existing bot', async () => {
     const original = incoming(sudaneseAnnouncement);
     await receive([original]);
@@ -134,6 +155,13 @@ describe('Baileys transport boundary', () => {
 });
 
 describe('group configuration', () => {
+  it('accepts per-group reminder options and rejects unsupported mention modes or offsets', () => {
+    const base = { id: group, leader, admins: [admin] };
+    const reminders = { offsetHours: [72, 24, 2], mentions: 'individual' };
+    expect(parseGroups([{ ...base, reminders }])[0]!.reminders).toEqual(reminders);
+    expect(() => parseGroups([{ ...base, reminders: { offsetHours: [24], mentions: 'plain_at_all' } }])).toThrow();
+    expect(() => parseGroups([{ ...base, reminders: { offsetHours: [2], mentions: 'none' } }])).toThrow();
+  });
   it('normalizes device JIDs and defaults to Africa/Khartoum', () => {
     expect(parseGroups([{ id: group, leader: '249900000001:7@s.whatsapp.net', admins: [admin, admin] }])).toEqual(configs());
   });
@@ -241,7 +269,7 @@ describe('offline safety and authentication persistence', () => {
       old.close();
       upgraded = new Store(path);
       expect(upgraded.group(group)?.leader).toBe(leader);
-      expect(upgraded.db.prepare('SELECT version FROM migrations ORDER BY version').all()).toEqual([{ version: 1 }, { version: 2 }]);
+      expect(upgraded.db.prepare('SELECT version FROM migrations ORDER BY version').all()).toEqual(migrations.map(m => ({ version: m.version })));
       expect(upgraded.db.prepare('SELECT COUNT(*) AS count FROM whatsapp_keys').get()?.count).toBe(0);
     } finally { upgraded?.close(); rmSync(folder, { recursive: true, force: true }); }
   });
