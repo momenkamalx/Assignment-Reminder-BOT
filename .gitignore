@@ -20,6 +20,7 @@ auth/
 auth_info/
 sessions/
 creds.json
+config/groups.json
 
 # Logs
 *.log

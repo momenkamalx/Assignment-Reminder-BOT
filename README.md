@@ -1,6 +1,6 @@
-# WhatsApp Assignment Reminder Bot — Stage 1
+# WhatsApp Assignment Reminder Bot — Stages 1 and 2
 
-A local Node.js + TypeScript prototype using SQLite, a mock WhatsApp adapter, and Vitest. No WhatsApp account, paid API, or cloud deployment is used.
+A Node.js + TypeScript prototype using SQLite, a mock WhatsApp adapter, Vitest, and an offline-tested Baileys integration. No WhatsApp account was paired, no live messages were sent, and no paid API or cloud deployment was used. Live startup is disabled by default. See [Stage 2 setup and safe testing](docs/stage-2.md).
 
 ## Run locally
 
@@ -66,8 +66,8 @@ The adapter contract is separate from parsing and business logic. Adapter failur
 
 ## Remaining stages
 
-Stage 2: Baileys connection, secure credentials and operational group configuration commands. Stage 3: reminders, retries, downtime recovery, confirmed changes/cancellations, and genuine mention-support investigation. No `@all` functionality is claimed or implemented. Stage 4: Oracle Cloud Always Free deployment, systemd, backups and operations documentation.
+Stage 2 provides the Baileys adapter, QR pairing entry point, external persistent credentials, reconnection handling and an explicit local group configuration file. A supervised real-account interoperability test remains pending. Stage 3: reminders, delivery retries, downtime recovery, confirmed changes/cancellations, and genuine mention-support investigation. No `@all` functionality is claimed or implemented. Stage 4: Oracle Cloud Always Free deployment, systemd, backups and operations documentation.
 
-Baileys is an unofficial WhatsApp integration. Future use may risk account restriction and must respect platform rules and group consent; no real connection exists here.
+Baileys is an unofficial WhatsApp integration. Future use may risk account restriction and must respect platform rules and group consent; its live connection is disabled by default.
 
 SQLite uses Node's built-in `node:sqlite` API; Node 24 may print an experimental warning. See the [Node 24 SQLite documentation](https://nodejs.org/docs/latest-v24.x/api/sqlite.html) and [Vitest guide](https://vitest.dev/guide/) for upstream references.

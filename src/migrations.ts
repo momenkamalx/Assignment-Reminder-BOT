@@ -8,4 +8,7 @@ export const migrations = [{
     CREATE TABLE assignments(id INTEGER PRIMARY KEY, group_id TEXT NOT NULL, original_id TEXT NOT NULL, position INTEGER NOT NULL CHECK(position>0), data TEXT NOT NULL, deadline TEXT NOT NULL, UNIQUE(group_id,original_id,position), FOREIGN KEY(group_id,original_id) REFERENCES announcements(group_id,message_id));
     CREATE INDEX upcoming_assignments ON assignments(group_id,deadline);
   `,
+}, {
+  version: 2,
+  sql: `CREATE TABLE whatsapp_keys(group_id TEXT NOT NULL REFERENCES groups(id), message_id TEXT NOT NULL, key_json TEXT NOT NULL, PRIMARY KEY(group_id,message_id));`,
 }];
