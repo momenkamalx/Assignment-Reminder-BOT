@@ -5,7 +5,7 @@ import type { Assignment, ReminderSettings } from '../types.js';
 export const messageId = () => randomBytes(16).toString('hex').toUpperCase();
 export const utcAfter = (now: string, ms: number) => new Date(Date.parse(now) + ms).toISOString();
 export interface SavedAssignment { id: number; group_id: string; data: string; deadline: string; status: string; version: number; registered_at: string | null }
-export interface Job { id: number; assignment_id: number; version: number; kind: 'approval' | 'reminder' | 'change'; offset_hours: number; due_at: string; next_attempt: string; message_id: string; status: string; attempts: number; lease_token: string | null; lease_until: string | null }
+export interface Job { id: number; assignment_id: number; version: number; kind: 'approval' | 'reminder' | 'change'; offset_hours: number; due_at: string; next_attempt: string; message_id: string; status: string; attempts: number; max_attempts: number; lease_token: string | null; lease_until: string | null }
 export function validateSettings(settings: ReminderSettings) {
   if (!Array.isArray(settings.offsetHours) || !settings.offsetHours.includes(24) || settings.offsetHours.some(h => ![24, 72, 2].includes(h)) || !['none', 'individual', 'native_all'].includes(settings.mentions)) throw new Error('Invalid reminder settings.');
 }

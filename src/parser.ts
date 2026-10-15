@@ -3,6 +3,7 @@ import type { Assignment } from './types.js';
 
 // Arabic uses Unicode letter boundaries; JavaScript \b only handles Latin word characters.
 const keyword = /\b(?:assignment|deadline|project|due|exercises?)\b|(?<![\p{L}\p{N}_])(?:و|ف|ب|ل)?(?:ال)?(?:واجب|تسليم|مشروع|تمرين|تمارين)(?![\p{L}\p{N}_])/iu;
+export const hasAssignmentKeyword = (text: string): boolean => keyword.test(text);
 const digits = (text: string) => text.replace(/[٠-٩]/g, c => String('٠١٢٣٤٥٦٧٨٩'.indexOf(c)));
 
 export function parseDeadline(text: string, zone = 'Africa/Khartoum'): Pick<Assignment, 'deadline' | 'deadlineIssue'> {
@@ -22,13 +23,15 @@ export function parseDeadline(text: string, zone = 'Africa/Khartoum'): Pick<Assi
 export function extractAssignments(text: string, zone = 'Africa/Khartoum'): Assignment[] {
   if (!keyword.test(text)) return [];
   const blocks = text.trim().split(/\n\s*\n|\n(?=\s*[0-9٠-٩]+[.)]\s)|\n(?=\s*(?:course|subject|المادة|مادة)\s*[:：])/iu);
-  return blocks.filter(block => keyword.test(block) && (/\d{4}-\d{2}-\d{2}|deadline|\bdue\b|تسليم|(?:course|subject|المادة|مادة)\s*[:：]|(?:عندنا|عليكم|مطلوب)\s+(?:واجب|مشروع|تمرين|تمارين)|\b(?:complete|submit|solve)\s+(?:the\s+)?(?:assignment|project|exercises?)\b/iu.test(digits(block)))).map(block => {
+  return blocks.filter(block => keyword.test(block) && (/\d{4}-\d{2}-\d{2}|deadline|\bdue\b|تسليم|(?:course|subject|المادة|مادة)\s*[:：]|(?:عندنا|عليكم|مطلوب)\s+(?:واجب|مشروع|تمرين|تمارين)|\b(?:complete|submit|solve)\s+(?:the\s+)?(?:assignment|project|exercises?)\b/iu.test(digits(block)) || /^\s*(?:assignment|project|exercises?|واجب|مشروع|تمرين|تمارين)\s*(?::|$)/iu.test(block))).map(block => {
     const course = block.match(/(?:course|subject|المادة|مادة)\s*[:：]\s*([^\n;]+)/iu)?.[1]?.trim() ?? null;
-    const name = block.match(/(?:assignment name|name|اسم التكليف)\s*[:：]\s*([^\n;]+)/iu)?.[1]?.trim() ?? null;
+    const name = block.match(/(?:assignment name|name|اسم التكليف|اسم الواجب)\s*[:：]\s*([^\n;]+)/iu)?.[1]?.trim() ?? null;
     const description = block.match(/(?:description|الوصف)\s*[:：]\s*([^\n]+)/iu)?.[1]?.trim() ?? null;
     const url = block.match(/https?:\/\/[^\s<>]+/iu)?.[0]?.replace(/[،,.)]+$/, '') ?? null;
     const email = block.match(/[\w.+-]+@[\w.-]+\.[a-z]{2,}/iu)?.[0] ?? null;
-    const custom = block.match(/(?:submission|التسليم)\s*[:：]\s*([^\n]+)/iu)?.[1]?.trim();
+    const candidate = block.match(/(?:submission|(?:مكان|طريقة|وجهة)\s+التسليم|التسليم)\s*[:：]\s*([^\n]+)/iu)?.[1]?.trim();
+    // A deadline under a submission label is not evidence of a submission destination.
+    const custom = candidate && !/^(?:\d{4}[-/]|يوم\b|بكرة|غد|tomorrow\b)/iu.test(digits(candidate)) ? candidate : undefined;
     const submissionMethod = /moodle|مودل|موودل/iu.test(block) ? (/SUST|السودان للعلوم/iu.test(block) ? 'SUST Moodle' : 'Moodle')
       : /forms\.gle|forms\.google|docs\.google\.com\/forms|google forms/iu.test(block) ? 'Google Forms'
       : /drive\.google|google drive/iu.test(block) ? 'Google Drive'

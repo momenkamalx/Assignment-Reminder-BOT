@@ -6,6 +6,7 @@ import { Bot } from '../src/bot.js';
 import { Store } from '../src/database.js';
 import { MockWhatsAppAdapter } from '../src/mock-adapter.js';
 import type { IncomingMessage } from '../src/types.js';
+import { ReminderWorker } from '../src/reminders/worker.js';
 import { expectedAssignments, missingDeadlineAnnouncement, sudaneseAnnouncement } from './fixtures/sudanese-announcement.js';
 
 let store: Store, adapter: MockWhatsAppAdapter, bot: Bot;
@@ -153,11 +154,14 @@ describe('admin workflow and permissions', () => {
     await bot.handle(message('!help', 'student'));
     expect(adapter.sent.at(-1)?.text).toContain('!edit');
   });
-  it('allows retry after an adapter failure without logging message content', async () => {
+  it('retains the draft and pending delivery after an adapter failure for later recovery', async () => {
     const original = message(announcement);
     const broken = new Bot(store, { send: async () => { throw new Error('mock transport failure'); } }, now);
-    await expect(broken.handle(original)).rejects.toThrow('mock transport failure');
-    await bot.handle(original); expect(adapter.sent).toHaveLength(1);
+    await expect(broken.handle(original)).resolves.toBeUndefined();
+    await bot.handle(original); expect(adapter.sent).toHaveLength(0);
+    const delivery = new ReminderWorker(store, adapter, () => true, () => '2027-01-01T00:00:01.000Z', 60000, () => {});
+    await delivery.flushOutgoing(); expect(adapter.sent).toHaveLength(1);
+    expect(store.db.prepare('SELECT COUNT(*) AS count FROM confirmations').get()!.count).toBe(1);
   });
 });
 

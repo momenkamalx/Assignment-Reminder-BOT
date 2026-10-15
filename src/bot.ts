@@ -1,18 +1,26 @@
 import { DateTime } from 'luxon';
 import { Store } from './database.js';
-import { extractAssignments, parseDeadline } from './parser.js';
+import { extractAssignments, hasAssignmentKeyword, parseDeadline } from './parser.js';
+import { diagnostic, noDiagnostics, type DiagnosticSink } from './diagnostics.js';
 import type { Assignment, IncomingMessage, WhatsAppAdapter } from './types.js';
+import { receiptFor, type Relevance } from './delivery/outbox.js';
+import { ReminderWorker } from './reminders/worker.js';
 
 export function preview(drafts: Assignment[], zone: string): string {
-  return drafts.map((d, i) => `${i + 1}. ${d.course ?? 'المادة غير مذكورة'} — ${d.name ?? 'اسم التكليف غير مذكور'}\n${d.description ?? ''}\nالموعد: ${d.deadline ? DateTime.fromISO(d.deadline).setZone(zone).toFormat('yyyy-MM-dd HH:mm ZZZZ') : d.deadlineIssue}\nالتسليم: ${d.submissionMethod ?? 'غير مذكور'} ${d.destination ?? ''}`).join('\n\n') + '\n\nهل تريد تسجيل التكليفات؟\nReply yes / نعم to this message; no / لا to reject.\nEdit by replying: !edit 1 deadline=2027-05-20 18:00';
+  return drafts.map((d, i) => `${i + 1}. ${d.course ?? 'المادة: غير محددة'} — ${d.name ?? 'اسم الواجب: غير محدد'}\n${d.description ?? ''}\nموعد التسليم: ${d.deadline && !d.deadlineIssue ? DateTime.fromISO(d.deadline).setZone(zone).toFormat('yyyy-MM-dd HH:mm ZZZZ') : `يحتاج توضيح (${d.deadlineIssue ?? 'Missing deadline'})`}\nمكان التسليم: ${d.submissionMethod ?? 'غير محدد'} ${d.destination ?? ''}`).join('\n\n') +
+    (drafts.some(d => !d.course || !d.name || !d.deadline || d.deadlineIssue || !d.submissionMethod) ? '\nيرجى توضيح البيانات غير المحددة بالرد على هذه المعاينة بأمر !edit. لا يتم التسجيل أو جدولة التذكيرات قبل تصحيح الموعد.' : '') +
+    '\n\nهل تريد تسجيل التكليفات؟\nReply yes / نعم to this message; no / لا to reject.\nEdit by replying: !edit 1 deadline=2027-05-20 18:00';
 }
 
 export class Bot {
   // Serialize messages within this process; SQLite transactions also protect separate connections.
   private queue: Promise<void> = Promise.resolve();
-  constructor(private store: Store, private adapter: WhatsAppAdapter, private now = () => new Date().toISOString()) {}
+  private delivery: ReminderWorker;
+  constructor(private store: Store, private adapter: WhatsAppAdapter, private now = () => new Date().toISOString(), private diagnostics: DiagnosticSink = noDiagnostics) {
+    this.delivery = new ReminderWorker(store, adapter, group => !!store.group(group) && (!adapter.authorized || adapter.authorized(group)), now, 60000, undefined, diagnostics);
+  }
   handle(message: IncomingMessage): Promise<void> {
-    const task = this.queue.then(() => this.process(message));
+    const task = this.queue.then(() => this.process(message)).then(() => this.delivery.flushOutgoing());
     this.queue = task.catch(() => {});
     return task;
   }
@@ -20,33 +28,41 @@ export class Bot {
     const group = this.store.group(m.groupId);
     if (!group) return;
     const text = m.text.trim();
-    const send = (content: string) => this.adapter.send(m.groupId, content, m.id);
+    const receipt = receiptFor(m);
+    const send = async (content: string, scope: Relevance = {}) => this.store.queueReply(m.groupId, content, this.now(), receipt, scope);
     if (text === '!help') {
-      await send('!list: upcoming assignments. Draft edits: reply !edit NUMBER FIELD=VALUE. Saved edits: !edit ID FIELD=VALUE; cancellation: !delete ID. Admin confirmation is required. Reply yes/نعم/y/يس or no/لا to the specific preview or immediate-reminder request.'); return;
+      await send('!list: upcoming assignments. Draft edits: reply !edit NUMBER FIELD=VALUE. Saved edits: !edit ID FIELD=VALUE; cancellation: !delete ID. Admin confirmation is required. Admin delivery controls: !delivery, !retry MESSAGE_ID. Reply yes/نعم/y/يس or no/لا to the specific preview or immediate-reminder request.'); return;
     }
     if (text === '!list') {
       const rows = this.store.upcoming(m.groupId, this.now());
       await send(rows.length ? rows.map(row => `${row.id}: ${preview([JSON.parse(row.data) as Assignment], group.timezone).split('\n\nهل')[0]}`).join('\n\n') : 'لا توجد تكليفات قادمة.'); return;
     }
     const isAdmin = (JSON.parse(group.admins) as string[]).includes(m.senderId);
+    if (isAdmin && text === '!delivery') { await send(JSON.stringify(this.store.deliveryReport(m.groupId))); return; }
+    if (isAdmin && /^!retry\s+\S+$/u.test(text)) {
+      const ok = this.store.retryDelivery(m.groupId, text.split(/\s+/)[1]!, this.now());
+      await send(ok ? 'تمت إعادة جدولة الرسالة بنفس معرفها.' : 'لا توجد رسالة فاشلة صالحة لإعادة المحاولة في هذه المجموعة.'); return;
+    }
     if (m.replyTo && isAdmin) {
       if (/^(نعم|يس|yes|y|لا|no)$/iu.test(text)) {
         const approve = /^(نعم|يس|yes|y)$/iu.test(text);
-        const result = this.store.confirmChange(m.groupId, m.replyTo, approve, this.now());
+        const result = this.store.confirmChange(m.groupId, m.replyTo, approve, this.now(), receipt);
         if (result !== undefined) {
-          await send(result === 'saved' ? 'تم تأكيد التغيير بنجاح.' : result === 'busy' ? 'تذكير قيد الإرسال؛ أعد التأكيد بعد اكتماله.' : result === 'invalid' ? 'الموعد غير صالح؛ أرسل طلب تعديل جديد.' : result === 'rejected' ? 'تم رفض التغيير.' : 'هذا الطلب لم يعد صالحاً.'); return;
+          return;
         }
-        if (this.store.confirmImmediate(m.groupId, m.replyTo, approve, this.now())) {
-          await send(approve ? 'تمت الموافقة على التذكير الفوري.' : 'تم رفض التذكير الفوري.'); return;
+        if (this.store.confirmImmediate(m.groupId, m.replyTo, approve, this.now(), receipt)) {
+          return;
         }
       }
-      const pending = this.store.confirmation(m.groupId, m.replyTo);
+      const pending = this.store.confirmation(m.groupId, m.replyTo, this.now());
       if (!pending) return;
       if (/^(نعم|يس|yes|y)$/iu.test(text)) {
-        const result = this.store.approve(m.groupId, m.replyTo, this.now());
-        await send(result === 'saved' ? 'تم تسجيل التكليفات بنجاح.' : result === 'invalid' ? 'صحح المواعيد المفقودة أو الغامضة أو الماضية قبل التسجيل.' : 'هذا التأكيد لم يعد صالحاً.'); return;
+        const result = this.store.approve(m.groupId, m.replyTo, this.now(), receipt);
+        if (result !== 'saved') await send(result === 'invalid' ? 'صحح المواعيد المفقودة أو الغامضة أو الماضية قبل التسجيل.' : 'هذا التأكيد لم يعد صالحاً.',
+          { originalId: pending.original_id, confirmationId: m.replyTo, announcementState: 'pending' });
+        return;
       }
-      if (/^(لا|no)$/iu.test(text)) { this.store.reject(m.groupId, pending.original_id); await send('تم رفض التسجيل.'); return; }
+      if (/^(لا|no)$/iu.test(text)) { this.store.reject(m.groupId, pending.original_id, this.now(), receipt); return; }
       if (text.startsWith('!edit')) {
         const match = text.match(/^!edit\s+(\d+)\s+(course|name|description|deadline|submissionMethod|destination)=(.+)$/s);
         const drafts = JSON.parse(pending.drafts) as Assignment[];
@@ -55,9 +71,8 @@ export class Bot {
         const field = match[2]!; const value = match[3]!.trim();
         if (field === 'deadline') Object.assign(drafts[index]!, parseDeadline(value, group.timezone));
         else Object.assign(drafts[index]!, { [field]: value });
-        const newId = await this.adapter.send(m.groupId, preview(drafts, group.timezone), pending.original_id);
-        this.store.db.prepare("UPDATE confirmations SET status='invalidated' WHERE group_id=? AND original_id=?").run(m.groupId, pending.original_id);
-        if (!this.store.addConfirmation(m.groupId, newId, pending.original_id, drafts)) await send('تم التعامل مع الإعلان بالفعل؛ هذه المعاينة لم تعد صالحة. استخدم !list للتحقق من التكليفات المسجلة.');
+        if (!this.store.replacePreview(m.groupId, m.replyTo, m.id, drafts, preview(drafts, group.timezone), this.now())) await send('تم التعامل مع الإعلان بالفعل؛ هذه المعاينة لم تعد صالحة. استخدم !list للتحقق من التكليفات المسجلة.');
+        else diagnostic(this.diagnostics, 'preview_queued', drafts.length);
         return;
       }
     }
@@ -75,7 +90,7 @@ export class Bot {
       }
       const request = this.store.requestChange(m.groupId, m.id, id, cancel ? 'cancel' : 'update', data, this.now());
       if (!request || request.delivered || request.status !== 'pending') return;
-      await send('تم استلام الطلب. انتظر رسالة التأكيد الخاصة بهذا التغيير ثم رد عليها بنعم أو لا.'); return;
+      await send('تم استلام الطلب. انتظر رسالة التأكيد الخاصة بهذا التغيير ثم رد عليها بنعم أو لا.', { changeId: request.message_id, changeState: 'pending' }); return;
     }
     // A leader can propose an extension, but cannot bypass the separate admin confirmation.
     if (!m.replyTo && m.senderId === group.leader && /تم\s+(?:تمديد|تأجيل)|(?:التسليم|الموعد)\s+(?:اتمدد|تمدد|اتأجل)|\bdeadline\s+(?:extended|extension)\b/iu.test(text)) {
@@ -91,20 +106,16 @@ export class Bot {
       }
       const data: Assignment = { ...JSON.parse(saved.data) as Assignment, ...deadline };
       const request = this.store.requestChange(m.groupId, m.id, id, 'update', data, this.now());
-      if (request && !request.delivered && request.status === 'pending') await send('تم استلام طلب التمديد. يجب أن يؤكده مسؤول بالرد على رسالة التأكيد الخاصة به.');
+      if (request && !request.delivered && request.status === 'pending') await send('تم استلام طلب التمديد. يجب أن يؤكده مسؤول بالرد على رسالة التأكيد الخاصة به.', { changeId: request.message_id, changeState: 'pending' });
       return;
     }
     // Replies and commands are never treated as new leader announcements.
     if (m.replyTo || text.startsWith('!') || m.senderId !== group.leader) return;
+    diagnostic(this.diagnostics, hasAssignmentKeyword(text) ? 'keyword_detected' : 'keyword_absent');
     const drafts = extractAssignments(text, group.timezone);
-    if (!drafts.length || !this.store.beginAnnouncement(m.groupId, m.id)) return;
-    try {
-      const id = await this.adapter.send(m.groupId, preview(drafts, group.timezone), m.id);
-      if (!this.store.addConfirmation(m.groupId, id, m.id, drafts)) await send('تم التعامل مع الإعلان بالفعل. استخدم !list للتحقق من التكليفات المسجلة.');
-    } catch (error) {
-      // No draft was created: allow the transport to retry this announcement.
-      this.store.db.prepare("DELETE FROM announcements WHERE group_id=? AND message_id=? AND status='pending'").run(m.groupId, m.id);
-      throw error;
+    diagnostic(this.diagnostics, !drafts.length ? 'parser_empty' : drafts.some(d => !d.course || !d.name || !d.deadline || d.deadlineIssue || !d.submissionMethod) ? 'parser_incomplete' : 'parser_accepted', drafts.length);
+    if (drafts.length && this.store.queueAnnouncement(m, drafts, preview(drafts, group.timezone), this.now(), receipt)) {
+      diagnostic(this.diagnostics, 'draft_created', drafts.length); diagnostic(this.diagnostics, 'preview_queued', drafts.length);
     }
   }
 }

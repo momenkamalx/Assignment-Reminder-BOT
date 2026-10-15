@@ -1,13 +1,20 @@
 import makeWASocket, { DisconnectReason, useMultiFileAuthState, type BaileysEventMap, type AuthenticationState } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import { mkdir, chmod } from 'node:fs/promises';
-import { BaileysAdapter, type Socket } from './adapter.js';
+import type { Socket } from './adapter.js';
+
+export interface RuntimeAdapter {
+  attach(socket?: Socket, connected?: boolean): void;
+  authorized(jid: string): boolean;
+  receive?: (event: BaileysEventMap['messages.upsert']) => Promise<void>;
+}
 
 export interface RuntimeDependencies {
   loadAuth: () => Promise<{ state: AuthenticationState; saveCreds: () => Promise<void> }>;
   createSocket: (auth: AuthenticationState) => Socket;
   qr: (value: string) => void;
   log: (event: string) => void;
+  acceptAccount?: (socket: Socket) => boolean;
 }
 export class WhatsAppRuntime {
   private socket?: Socket;
@@ -17,7 +24,7 @@ export class WhatsAppRuntime {
   private generation = 0;
   private tasks: Promise<void> = Promise.resolve();
   private unbind?: () => void;
-  constructor(private adapter: BaileysAdapter, private deps: RuntimeDependencies) {}
+  constructor(private adapter: RuntimeAdapter, private deps: RuntimeDependencies) {}
   async start() {
     if (!this.stopped) return;
     this.stopped = false;
@@ -38,11 +45,15 @@ export class WhatsAppRuntime {
     const creds = () => { if (active()) enqueue(async () => {
       try { await auth.saveCreds(); } catch { this.deps.log('auth-save-failed'); this.stop(); }
     }, true); };
-    const messages = (event: BaileysEventMap['messages.upsert']) => enqueue(() => this.adapter.receive(event));
+    const messages = (event: BaileysEventMap['messages.upsert']) => enqueue(async () => { await this.adapter.receive?.(event); });
     const connection = (update: BaileysEventMap['connection.update']) => {
       if (!active()) return;
       if (update.qr) this.deps.qr(update.qr);
-      if (update.connection === 'open') { this.attempts = 0; this.adapter.attach(socket, true); this.deps.log('whatsapp-connected'); }
+      if (!active()) return; // A guarded live launcher can stop on an unexpected QR.
+      if (update.connection === 'open') {
+        if (this.deps.acceptAccount && !this.deps.acceptAccount(socket)) { this.deps.log('whatsapp-account-mismatch'); this.stop(); return; }
+        this.attempts = 0; this.adapter.attach(socket, true); this.deps.log('whatsapp-connected');
+      }
       if (update.connection === 'close') {
         const code = (update.lastDisconnect?.error as { output?: { statusCode?: number } } | undefined)?.output?.statusCode;
         this.detach();
@@ -55,7 +66,7 @@ export class WhatsAppRuntime {
       }
     };
     socket.ev.on('creds.update', creds);
-    socket.ev.on('messages.upsert', messages);
+    if (this.adapter.receive) socket.ev.on('messages.upsert', messages);
     socket.ev.on('connection.update', connection);
     this.unbind = () => {
       socket.ev.off('creds.update', creds); socket.ev.off('messages.upsert', messages); socket.ev.off('connection.update', connection);
@@ -80,7 +91,7 @@ export class WhatsAppRuntime {
   async idle() { await this.tasks; }
 }
 
-export function liveDependencies(adapter: BaileysAdapter, authDir: string, qr: (value: string) => void): RuntimeDependencies {
+export function liveDependencies(adapter: Pick<RuntimeAdapter, 'authorized'>, authDir: string, qr: (value: string) => void): RuntimeDependencies {
   return {
     loadAuth: async () => {
       await mkdir(authDir, { recursive: true, mode: 0o700 });

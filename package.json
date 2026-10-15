@@ -12,13 +12,15 @@
     "test:watch": "vitest",
     "demo": "tsx src/demo.ts",
     "demo:reminders": "tsx src/demo-reminders.ts",
-    "whatsapp": "tsx --env-file-if-exists=.env src/whatsapp/main.ts"
+    "whatsapp": "tsx --env-file-if-exists=.env src/whatsapp/main.ts",
+    "pilot:live": "tsx --env-file=.env.pilot src/pilot/live.ts"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "7.0.0-rc14",
     "luxon": "^3.7.2",
     "pino": "10.4.0",
-    "qrcode-terminal": "0.12.0"
+    "qrcode-terminal": "0.12.0",
+    "whatsapp-rust-bridge": "0.5.4"
   },
   "devDependencies": {
     "@types/luxon": "^3.7.1",

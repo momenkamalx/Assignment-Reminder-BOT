@@ -4,6 +4,8 @@ import { dirname } from 'node:path';
 import type { Assignment, ReminderSettings } from './types.js';
 import { migrations } from './migrations.js';
 import { planAssignment, validateSettings, messageId, type SavedAssignment } from './reminders/storage.js';
+import { enqueue, relevant, type Receipt, type Relevance, type Outgoing } from './delivery/outbox.js';
+import type { IncomingMessage, MessageReference } from './types.js';
 
 export class Store {
   readonly db: DatabaseSync;
@@ -29,8 +31,44 @@ export class Store {
   group(id: string) {
     return this.db.prepare('SELECT * FROM groups WHERE id=?').get(id) as { id: string; leader: string; admins: string; timezone: string } | undefined;
   }
-  confirmation(group: string, id: string) {
-    return this.db.prepare('SELECT * FROM confirmations WHERE group_id=? AND message_id=? AND status=\'pending\'').get(group, id) as { original_id: string; drafts: string } | undefined;
+  confirmation(group: string, id: string, now?: string) {
+    return this.db.prepare(`SELECT c.* FROM confirmations c JOIN announcements a ON a.group_id=c.group_id AND a.message_id=c.original_id
+      WHERE c.group_id=? AND c.message_id=? AND c.status='pending' AND a.status='pending'
+      AND NOT EXISTS(SELECT 1 FROM outgoing_messages q WHERE q.group_id=c.group_id AND q.confirmation_id=c.message_id AND q.kind='preview' AND (q.status IN ('failed','cancelled','expired') OR (? IS NOT NULL AND q.expires_at<=?)))
+      AND (c.delivered=1 OR EXISTS(SELECT 1 FROM outgoing_messages q WHERE q.group_id=c.group_id AND q.confirmation_id=c.message_id AND q.kind='preview' AND q.attempts>0 AND q.status IN ('pending','sending','sent')))`)
+      .get(group, id, now ?? null, now ?? null) as { original_id: string; drafts: string } | undefined;
+  }
+  queueReply(group: string, text: string, now: string, receipt: Receipt, scope: Relevance = {}) {
+    return enqueue(this.db, group, `feedback:${receipt.sourceId}`, 'feedback', text, now, receipt, scope);
+  }
+  queueAnnouncement(m: IncomingMessage, drafts: Assignment[], text: string, now: string, receipt: Receipt) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      if (!this.beginAnnouncement(m.groupId, m.id)) { this.db.exec('COMMIT'); return false; }
+      const mid = messageId();
+      this.db.prepare('INSERT INTO confirmations(group_id,message_id,original_id,drafts,delivered) VALUES(?,?,?,?,0)').run(m.groupId, mid, m.id, JSON.stringify(drafts));
+      enqueue(this.db, m.groupId, `preview:${mid}`, 'preview', text, now, receipt,
+        { originalId: m.id, confirmationId: mid, announcementState: 'pending' }, mid);
+      this.db.exec('COMMIT'); return true;
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+  replacePreview(group: string, previous: string, source: string, drafts: Assignment[], text: string, now: string) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const pending = this.confirmation(group, previous, now);
+      if (!pending) { this.db.exec('COMMIT'); return false; }
+      const queued = this.db.prepare("SELECT quote_json FROM outgoing_messages WHERE group_id=? AND confirmation_id=? AND kind='preview'").get(group, previous);
+      const legacy = this.db.prepare('SELECT key_json FROM whatsapp_keys WHERE group_id=? AND message_id=?').get(group, pending.original_id);
+      const quote = queued?.quote_json ? JSON.parse(queued.quote_json as string) as MessageReference : legacy ? JSON.parse(legacy.key_json as string) as MessageReference :
+        { id: pending.original_id, remoteJid: group, participant: this.group(group)!.leader, fromMe: false };
+      this.db.prepare("UPDATE confirmations SET status='invalidated' WHERE group_id=? AND original_id=?").run(group, pending.original_id);
+      this.db.prepare("UPDATE outgoing_messages SET status='cancelled',lease_token=NULL,lease_until=NULL WHERE group_id=? AND original_id=? AND kind='preview' AND status IN ('pending','sending','failed')").run(group, pending.original_id);
+      const mid = messageId();
+      this.db.prepare('INSERT INTO confirmations(group_id,message_id,original_id,drafts,delivered) VALUES(?,?,?,?,0)').run(group, mid, pending.original_id, JSON.stringify(drafts));
+      enqueue(this.db, group, `edited-preview:${source}`, 'preview', text, now, { sourceId: source, replyTo: pending.original_id, quote },
+        { originalId: pending.original_id, confirmationId: mid, announcementState: 'pending' }, mid);
+      this.db.exec('COMMIT'); return true;
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
   beginAnnouncement(group: string, original: string): boolean {
     return this.db.prepare('INSERT OR IGNORE INTO announcements(group_id,message_id) VALUES(?,?)').run(group, original).changes === 1;
@@ -40,10 +78,10 @@ export class Store {
     // A single guarded write prevents a late preview from reopening a completed announcement.
     return this.db.prepare("INSERT INTO confirmations(group_id,message_id,original_id,drafts) SELECT ?,?,?,? WHERE EXISTS(SELECT 1 FROM announcements WHERE group_id=? AND message_id=? AND status='pending')").run(group, id, original, JSON.stringify(drafts), group, original).changes === 1;
   }
-  approve(group: string, confirmationId: string, now: string): 'saved' | 'stale' | 'invalid' {
+  approve(group: string, confirmationId: string, now: string, receipt?: Receipt): 'saved' | 'stale' | 'invalid' {
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      const pending = this.confirmation(group, confirmationId);
+      const pending = this.confirmation(group, confirmationId, now);
       if (!pending) { this.db.exec('COMMIT'); return 'stale'; }
       const drafts = JSON.parse(pending.drafts) as Assignment[];
       if (!drafts.length || drafts.some(d => !d.deadline || d.deadlineIssue || d.deadline <= now)) { this.db.exec('COMMIT'); return 'invalid'; }
@@ -54,14 +92,19 @@ export class Store {
         planAssignment(this.db, Number(row.lastInsertRowid), now);
       });
       this.db.prepare("UPDATE confirmations SET status='invalidated' WHERE group_id=? AND original_id=?").run(group, pending.original_id);
+      this.db.prepare("UPDATE outgoing_messages SET status='cancelled',lease_token=NULL,lease_until=NULL WHERE group_id=? AND original_id=? AND kind='preview' AND status IN ('pending','sending','failed')").run(group, pending.original_id);
+      enqueue(this.db, group, `registration-success:${pending.original_id}`, 'success', 'تم تسجيل التكليفات بنجاح.', now, receipt,
+        { originalId: pending.original_id, announcementState: 'approved' });
       this.db.exec('COMMIT'); return 'saved';
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
-  reject(group: string, original: string) {
+  reject(group: string, original: string, now = new Date().toISOString(), receipt?: Receipt) {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       this.db.prepare("UPDATE announcements SET status='rejected' WHERE group_id=? AND message_id=? AND status='pending'").run(group, original);
       this.db.prepare("UPDATE confirmations SET status='invalidated' WHERE group_id=? AND original_id=?").run(group, original);
+      this.db.prepare("UPDATE outgoing_messages SET status='cancelled',lease_token=NULL,lease_until=NULL WHERE group_id=? AND original_id=? AND kind='preview' AND status IN ('pending','sending','failed')").run(group, original);
+      if (receipt) enqueue(this.db, group, `rejection:${original}`, 'feedback', 'تم رفض التسجيل.', now, receipt, { originalId: original, announcementState: 'rejected' });
       this.db.exec('COMMIT');
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
@@ -99,7 +142,7 @@ export class Store {
     return { message_id: mid, delivered: 0, status: 'pending' };
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
-  confirmChange(group: string, mid: string, approve: boolean, now: string): 'saved' | 'rejected' | 'stale' | 'busy' | 'invalid' | undefined {
+  confirmChange(group: string, mid: string, approve: boolean, now: string, receipt?: Receipt): 'saved' | 'rejected' | 'stale' | 'busy' | 'invalid' | undefined {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const change = this.db.prepare("SELECT * FROM assignment_changes WHERE group_id=? AND message_id=? AND status='pending' AND delivered=1").get(group, mid) as { assignment_id: number; version: number; action: string; data: string } | undefined;
@@ -125,15 +168,41 @@ export class Store {
         }
       }
       if (result !== 'busy' && result !== 'invalid') this.db.prepare('UPDATE assignment_changes SET status=? WHERE group_id=? AND message_id=?').run(result, group, mid);
+      if (receipt) this.queueReply(group, result === 'saved' ? 'تم تأكيد التغيير بنجاح.' : result === 'busy' ? 'تذكير قيد الإرسال؛ أعد التأكيد بعد اكتماله.' : result === 'invalid' ? 'الموعد غير صالح؛ أرسل طلب تعديل جديد.' : result === 'rejected' ? 'تم رفض التغيير.' : 'هذا الطلب لم يعد صالحاً.', now, receipt,
+        { changeId: mid, changeState: result === 'busy' || result === 'invalid' ? 'pending' : result });
       this.db.exec('COMMIT'); return result;
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
-  confirmImmediate(group: string, mid: string, approve: boolean, now: string): boolean {
+  confirmImmediate(group: string, mid: string, approve: boolean, now: string, receipt?: Receipt): boolean {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const prompt = this.db.prepare("SELECT j.assignment_id,j.version FROM reminder_jobs j JOIN assignments a ON a.id=j.assignment_id WHERE a.group_id=? AND a.status='active' AND a.deadline>? AND a.version=j.version AND j.message_id=? AND j.kind='approval' AND j.status='sent'").get(group, now, mid) as { assignment_id: number; version: number } | undefined;
       const changed = prompt ? this.db.prepare("UPDATE reminder_jobs SET status=?,next_attempt=? WHERE assignment_id=? AND version=? AND kind='reminder' AND offset_hours=0 AND status='awaiting_approval'").run(approve ? 'pending' : 'cancelled', now, prompt.assignment_id, prompt.version).changes : 0;
+      if (changed && receipt) this.queueReply(group, approve ? 'تمت الموافقة على التذكير الفوري.' : 'تم رفض التذكير الفوري.', now, receipt);
       this.db.exec('COMMIT'); return !!changed;
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+  deliveryReport(group: string) {
+    return {
+      states: this.db.prepare('SELECT status,COUNT(*) AS count FROM outgoing_messages WHERE group_id=? GROUP BY status').all(group),
+      failures: this.db.prepare(`SELECT message_id,kind,attempts,failure_reason FROM outgoing_messages WHERE group_id=? AND status='failed'
+        UNION ALL SELECT j.message_id,j.kind,j.attempts,j.failure_reason FROM reminder_jobs j JOIN assignments a ON a.id=j.assignment_id WHERE a.group_id=? AND j.status='failed'`).all(group, group),
+    };
+  }
+  retryDelivery(group: string, mid: string, now: string) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const q = this.db.prepare("SELECT * FROM outgoing_messages WHERE group_id=? AND message_id=? AND status='failed'").get(group, mid) as unknown as Outgoing | undefined;
+      let changed = false;
+      if (q && relevant(this.db, q, now)) {
+        this.db.prepare("UPDATE outgoing_messages SET status='pending',attempts=0,next_attempt=?,failure_reason=NULL,failed_at=NULL WHERE id=?").run(now, q.id);
+        if (q.confirmation_id) this.db.prepare('UPDATE confirmations SET delivery_error=NULL WHERE group_id=? AND message_id=?').run(group, q.confirmation_id);
+        changed = true;
+      } else if (!q) {
+        const job = this.db.prepare(`SELECT j.id FROM reminder_jobs j JOIN assignments a ON a.id=j.assignment_id WHERE a.group_id=? AND j.message_id=? AND j.status='failed' AND a.status='active' AND a.version=j.version AND (j.kind='change' OR a.deadline>?)`).get(group, mid, now);
+        if (job) { this.db.prepare("UPDATE reminder_jobs SET status='pending',attempts=0,next_attempt=?,failure_reason=NULL,failed_at=NULL WHERE id=?").run(now, Number(job.id)); changed = true; }
+      }
+      this.db.exec('COMMIT'); return changed;
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
   close() { this.db.close(); }

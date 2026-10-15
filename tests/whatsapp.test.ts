@@ -11,6 +11,7 @@ import { applyGroups, parseGroups } from '../src/whatsapp/config.js';
 import { liveDependencies, WhatsAppRuntime } from '../src/whatsapp/runtime.js';
 import { externalAuthPath } from '../src/whatsapp/auth-path.js';
 import { migrations } from '../src/migrations.js';
+import { ReminderWorker } from '../src/reminders/worker.js';
 import { DatabaseSync } from 'node:sqlite';
 import { sudaneseAnnouncement } from './fixtures/sudanese-announcement.js';
 
@@ -28,7 +29,7 @@ class FakeSocket {
   ev = new EventEmitter();
   user = { id: self, lid: '555@lid' };
   end = vi.fn();
-  sendMessage = vi.fn(async (_group: string, _content: unknown, _options: unknown): Promise<WAMessage> => ({ key: { remoteJid: _group, id: crypto.randomUUID(), fromMe: true } }));
+  sendMessage = vi.fn(async (_group: string, _content: unknown, _options: unknown): Promise<WAMessage> => ({ key: { remoteJid: _group, id: (_options as { messageId?: string })?.messageId ?? crypto.randomUUID(), fromMe: true } }));
   asSocket() { return this as unknown as Socket; }
 }
 let store: Store, adapter: BaileysAdapter, socket: FakeSocket;
@@ -227,14 +228,16 @@ describe('connection lifecycle (fake sockets only)', () => {
     expect(f.sockets[0]!.end).toHaveBeenCalled();
     expect(f.log.mock.calls.flat().join(' ')).not.toContain('SECRET');
   });
-  it('reports a handler failure and continues with later incoming events', async () => {
+  it('persists a transport failure for worker recovery without losing the incoming draft', async () => {
     const f = setup(); await runtime.start(); const s = f.sockets[0]!;
     s.ev.emit('connection.update', { connection: 'open' });
     s.sendMessage.mockRejectedValueOnce(new Error('sensitive transport error'));
     const original = incoming(sudaneseAnnouncement);
     s.ev.emit('messages.upsert', { messages: [original], type: 'notify' }); await runtime.idle();
-    expect(f.log).toHaveBeenCalledWith('whatsapp-handler-error');
+    expect(store.db.prepare('SELECT status,attempts FROM outgoing_messages').get()).toMatchObject({ status: 'pending', attempts: 1 });
     s.ev.emit('messages.upsert', { messages: [original], type: 'notify' }); await runtime.idle();
+    const delivery = new ReminderWorker(store, adapter, () => true, () => '2027-01-01T00:00:01.000Z', 60000, () => {});
+    await delivery.flushOutgoing();
     expect(s.sendMessage).toHaveBeenCalledTimes(2);
   });
   it('retries a transient socket-creation failure during reconnection', async () => {
