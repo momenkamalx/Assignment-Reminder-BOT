@@ -4,6 +4,8 @@ A Node.js + TypeScript prototype using SQLite, a mock WhatsApp adapter, Vitest, 
 
 Before Stage 4, read the [end-to-end integration results and readiness assessment](docs/integration-review.md). Run `npm test -- tests/end-to-end.test.ts` to repeat the complete mocked-event and temporary-database workflow without pairing an account.
 
+The [outgoing-message reliability guide](docs/outgoing-reliability.md) documents durable previews/success replies, shared retries, failure recovery and the updated readiness assessment. Run `npm test -- tests/outbox.test.ts` for offline fault-injection tests. Admins can inspect `!delivery` and recover eligible failures with `!retry MESSAGE_ID`; `npm run delivery -- status` works locally without WhatsApp.
+
 ## Run locally
 
 Install Node.js 24 or later. In PowerShell inside this folder:
@@ -65,7 +67,7 @@ The regression fixture in `tests/fixtures/sudanese-announcement.ts` contains one
 
 Raw chat messages are not stored or logged. Only configured identities, announcement IDs and extracted assignment data are retained. Database files may contain personal identifiers and submission addresses; keep the data folder private. `.gitignore` excludes databases, `.env` and future authentication storage. `.env.example` documents configuration; the demo reads `DATABASE_PATH` from the process environment, not automatically from `.env` (Node's `--env-file` can load it). There are no WhatsApp credentials in Stage 1.
 
-The adapter contract is separate from parsing and business logic. Stage 3 adds persistent jobs and retries for reminders, late-registration permission prompts and saved-assignment change previews. The original leader-announcement preview and registration success acknowledgement still use the Stage 1 direct-send path; an interrupted preview or lost success response requires a replay or `!list` check. External transport and SQLite writes cannot be made atomic; the Stage 3 guide explains delivery uncertainty.
+The adapter contract is separate from parsing and business logic. The shared worker handles reminders, permission/change requests, leader previews, registration success and feedback. SQLite persists delivery intent first, and registration queues success transactionally. Bounded retries, failure reports and stable IDs reduce silent loss and duplicates; external transport and SQLite writes cannot be atomic. See the reliability guide for uncertainty and recovery limits.
 
 ## Remaining stages
 

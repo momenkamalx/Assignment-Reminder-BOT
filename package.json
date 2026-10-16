@@ -12,8 +12,15 @@
     "test:watch": "vitest",
     "demo": "tsx src/demo.ts",
     "demo:reminders": "tsx src/demo-reminders.ts",
+    "delivery": "tsx --env-file-if-exists=.env src/delivery-cli.ts",
     "whatsapp": "tsx --env-file-if-exists=.env src/whatsapp/main.ts",
-    "pilot:live": "tsx --env-file=.env.pilot src/pilot/live.ts"
+    "pilot:pair": "tsx --env-file=.env.pilot src/pilot/pair.ts",
+    "pilot:live": "tsx --env-file=.env.pilot src/pilot/live.ts",
+    "pilot:metadata": "tsx --env-file=.env.pilot src/pilot/metadata-main.ts",
+    "pilot:one-shot": "tsx --env-file=.env.pilot src/pilot/one-shot-main.ts",
+    "pilot:configure": "tsx --env-file=.env.pilot src/pilot/configure-main.ts",
+    "pilot:check": "tsx --env-file=.env.pilot src/pilot/check-main.ts",
+    "pilot:sync": "tsx --env-file=.env.pilot src/pilot/sync-main.ts"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "7.0.0-rc14",

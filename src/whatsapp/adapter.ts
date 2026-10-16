@@ -20,13 +20,18 @@ export class BaileysAdapter implements WhatsAppAdapter {
   ready(jid: string) { return this.authorized(jid) && this.connected && !!this.socket; }
   attach(socket?: Socket, connected = false) { this.socket = socket; this.connected = connected; }
   async receive(event: BaileysEventMap['messages.upsert']) {
-    if (event.type !== 'notify' || !this.connected || !this.socket) return;
+    diagnostic(this.diagnostics, event.type === 'notify' ? 'adapter_upsert_notify' : event.type === 'append' ? 'adapter_upsert_append' : 'adapter_upsert_other');
+    if (!this.connected || !this.socket) { diagnostic(this.diagnostics, 'adapter_disconnected'); return; }
+    if (event.type !== 'notify') return;
     for (const raw of event.messages) {
-      const { key } = raw;
+      const key = raw?.key;
+      if (!key || typeof key.remoteJid !== 'string') { diagnostic(this.diagnostics, 'message_key_invalid'); continue; }
       if (!key.remoteJid || !this.authorized(key.remoteJid)) { diagnostic(this.diagnostics, 'group_rejected'); continue; }
       diagnostic(this.diagnostics, 'message_received'); diagnostic(this.diagnostics, 'group_matched');
       // Check routing before looking at the message body or retaining anything.
-      if (!key.remoteJid || !this.authorized(key.remoteJid) || key.fromMe || !key.id || !key.participant) continue;
+      if (key.fromMe) { diagnostic(this.diagnostics, 'self_message_rejected'); continue; }
+      if (typeof key.id !== 'string' || !key.id || typeof key.participant !== 'string' || !key.participant ||
+          (key.participantAlt != null && typeof key.participantAlt !== 'string')) { diagnostic(this.diagnostics, 'message_key_invalid'); continue; }
       const group = this.groups.find(g => g.id === key.remoteJid)!;
       const identities = [key.participant, key.participantAlt].filter((v): v is string => !!v).map(jidNormalizedUser);
       const permitted = [group.leader, ...group.admins];

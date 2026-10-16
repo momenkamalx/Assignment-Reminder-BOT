@@ -2,6 +2,8 @@
 
 Reviewed on 2026-10-13. Stage 4 was not started. No real account was connected, no live messages were sent, no cloud deployment was performed, and no commit or push was created for this review. The existing user changes to AGENTS.md were not edited or included.
 
+Subsequent reliability work fixes the direct-send preview/success gap described in this historical review. See [the updated delivery and readiness assessment](outgoing-reliability.md) for current behavior, tests and remaining limits.
+
 ## Results
 
 The baseline had 126 passing tests. The completed review has **139 passing tests across 5 test files**, including 13 new end-to-end cases. `npm run build` passes. `npm run demo:reminders` passes and prints two mock reminders, respecting the updated deadline and cancellation with no duplicate delivery on repeated ticks.

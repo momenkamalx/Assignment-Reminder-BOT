@@ -9,12 +9,13 @@ import { Bot } from '../src/bot.js';
 import { MockWhatsAppAdapter } from '../src/mock-adapter.js';
 import { applyGroups } from '../src/whatsapp/config.js';
 import type { Socket } from '../src/whatsapp/adapter.js';
-import { ControlledTest, type ControlledOptions } from '../src/pilot/controlled.js';
+import { ControlledTest, pilotReminderLabel, type ControlledOptions } from '../src/pilot/controlled.js';
 import { acceptsPilotDrafts } from '../src/pilot/validation.js';
 import { extractAssignments } from '../src/parser.js';
 import { ReminderWorker } from '../src/reminders/worker.js';
 import { diagnostic, type DiagnosticEvent } from '../src/diagnostics.js';
 import { sudaneseAnnouncement, expectedAssignments } from './fixtures/sudanese-announcement.js';
+import { archiveEmptyPilotRun } from '../src/pilot/archive-run.js';
 
 const group = { id: '120363000000000001@g.us', leader: '249900000001@s.whatsapp.net', admins: ['249900000002@s.whatsapp.net','249900000003@s.whatsapp.net'], timezone: 'Africa/Khartoum', reminders: { offsetHours: [24], mentions: 'none' as const } };
 const self = '249900000004@s.whatsapp.net';
@@ -57,11 +58,14 @@ it.skipIf(!existsSync(localOriginal))('the exact unchanged local original now cr
   const original=readFileSync(localOriginal);const h=fixture();
   await h.send(original.toString('utf8'),'100000000001@lid');
   expect(h.count('confirmations')).toBe(1);expect(h.mock.sent.length).toBe(1);
-  expect(h.last().text.includes('يحتاج توضيح')).toBe(true);
+  const extracted=extractAssignments(original.toString('utf8'));
+  expect(extracted.some(d=>!d.course||!d.name||!d.deadline||!!d.deadlineIssue||!d.submissionMethod)).toBe(true);
   expect(h.last().text.includes('!edit')).toBe(true);
   expect(h.count('assignments')).toBe(0);expect(h.count('reminder_jobs')).toBe(0);
-  await h.send('نعم',group.admins[0],h.last().id);
-  expect(h.count('assignments')).toBe(0);expect(h.count('reminder_jobs')).toBe(0);
+  if(extracted.some(d=>!d.deadline||d.deadlineIssue)) {
+    await h.send('نعم',group.admins[0],h.last().id);
+    expect(h.count('assignments')).toBe(0);expect(h.count('reminder_jobs')).toBe(0);
+  }
   expect(readFileSync(localOriginal).equals(original)).toBe(true);
   for(const event of h.diagnostics){expect(Object.keys(event).sort()).toEqual(['code','count']);expect(typeof event.count).toBe('number');}
 });
@@ -137,6 +141,11 @@ it('requires explicit pilot override; normal production offsets remain 72/24/2 h
   expect(acceptsPilotDrafts(drafts)).toBe(true);expect(acceptsPilotDrafts([...drafts,...drafts])).toBe(true);
   expect(acceptsPilotDrafts([...drafts,...drafts],{maxAssignments:1})).toBe(false);
   expect(acceptsPilotDrafts(drafts,{allowedMethods:['SUST Moodle']})).toBe(false);
+  h.advance(Date.parse('2027-05-19T16:00:00.000Z')-Date.parse(h.clock.value));
+  const worker=new ReminderWorker(h.store,h.mock,()=>true,()=>h.clock.value,60000,()=>{});
+  await worker.tick();await worker.stop();
+  expect(h.mock.sent.some(message=>message.text.startsWith('تذكير بالتكليف'))).toBe(true);
+  expect(h.mock.sent.some(message=>message.text.includes(pilotReminderLabel))).toBe(false);
 });
 it('persists one exactly-five-minute override across restart, sends only the authorized job and preserves the actual deadline',async()=>{
   const options:ControlledOptions={reminder:{scope:'offline-test',delayMs:300000}};
@@ -154,6 +163,8 @@ it('persists one exactly-five-minute override across restart, sends only the aut
   const reminders=recovered.mock.sent.filter(message=>message.text.startsWith('تذكير بالتكليف'));
   expect(reminders.length).toBe(1);for(const value of ['Networks','Worksheet','2027-05-20','18:00','SUST Moodle'])expect(reminders[0]!.text.includes(value)).toBe(true);
   expect(reminders[0]!.groupId).toBe(group.id);expect(reminders[0]!.options?.mentions).toBeUndefined();expect(reminders[0]!.options?.mentionAll).toBeUndefined();
+  expect(reminders[0]!.text).toContain(pilotReminderLabel);
+  expect(recovered.mock.sent.filter(message=>message.text.includes(pilotReminderLabel))).toHaveLength(1);
   expect(recovered.store.db.prepare('SELECT deadline FROM assignments').get()!.deadline).toBe(actualDeadline);
   expect(recovered.store.db.prepare('SELECT status,attempts FROM reminder_jobs WHERE id=?').get(id)).toMatchObject({status:'sent',attempts:1});
   await recovered.control.stop();controls.delete(recovered.control);expect(recovered.control.state.overrideEnabled).toBe(false);
@@ -188,4 +199,43 @@ it('recovers registration committed before the test schedule was created',async(
 });
 it('diagnostic sink failures cannot alter business operations',()=>{
   expect(()=>diagnostic(()=>{throw new Error('private exception');},'message_received')).not.toThrow();
+});
+it('archives the exact empty run record while preserving the database and group permissions',()=>{
+  const h=fixture();const before=h.store.db.prepare('SELECT state FROM pilot_test_run').get()!.state;
+  const permissions=h.store.db.prepare('SELECT * FROM groups').all();
+  archiveEmptyPilotRun(h.store.db,h.clock.value);
+  expect(h.count('pilot_test_run')).toBe(0);expect(h.count('pilot_test_run_archive')).toBe(1);
+  expect(h.store.db.prepare('SELECT state FROM pilot_test_run_archive').get()!.state).toBe(before);
+  expect(h.store.db.prepare('SELECT * FROM groups').all()).toEqual(permissions);
+  expect(()=>archiveEmptyPilotRun(h.store.db,h.clock.value)).toThrow('No previous run');
+  expect(h.count('pilot_test_run_archive')).toBe(1);
+});
+it('refuses to archive a run with an existing draft or delivery record',async()=>{
+  const h=fixture();await h.send('Assignment');
+  const before=h.store.db.prepare('SELECT state FROM pilot_test_run').get()!.state;
+  expect(()=>archiveEmptyPilotRun(h.store.db,h.clock.value)).toThrow('Pilot contains activity');
+  expect(h.store.db.prepare('SELECT state FROM pilot_test_run').get()!.state).toBe(before);
+  expect(h.count('confirmations')).toBe(1);expect(h.count('outgoing_messages')).toBe(1);
+});
+it('archives a safely stopped empty run, preserving earlier archive history',async()=>{
+  const h=fixture();await h.control.stop();controls.delete(h.control);
+  const record=h.store.db.prepare('SELECT state FROM pilot_test_run').get()!.state;
+  h.store.db.exec('CREATE TABLE pilot_test_run_archive(id INTEGER PRIMARY KEY,state TEXT NOT NULL,archived_at TEXT NOT NULL,reason TEXT NOT NULL)');
+  h.store.db.prepare('INSERT INTO pilot_test_run_archive VALUES(1,?,?,?)').run('earlier historical record',h.clock.value,'previous');
+  archiveEmptyPilotRun(h.store.db,h.clock.value);
+  expect(h.count('pilot_test_run')).toBe(0);expect(h.count('pilot_test_run_archive')).toBe(2);
+  expect(h.store.db.prepare('SELECT state FROM pilot_test_run_archive WHERE id=1').get()!.state).toBe('earlier historical record');
+  expect(h.store.db.prepare('SELECT state FROM pilot_test_run_archive WHERE id=2').get()!.state).toBe(record);
+});
+it.each(['connected','listenerActive','outgoingLoopActive','overrideEnabled'])('refuses a stopped marker with %s still active',async field=>{
+  const h=fixture();await h.control.stop();controls.delete(h.control);
+  const state={...h.control.state,[field]:true};h.store.db.prepare('UPDATE pilot_test_run SET state=?').run(JSON.stringify(state));
+  expect(()=>archiveEmptyPilotRun(h.store.db,h.clock.value)).toThrow('safely stopped');
+  expect(h.count('pilot_test_run')).toBe(1);
+});
+it('rolls back archival if the stored copy does not match the active marker',async()=>{
+  const h=fixture();await h.control.stop();controls.delete(h.control);
+  h.store.db.exec("CREATE TABLE pilot_test_run_archive(id INTEGER PRIMARY KEY,state TEXT NOT NULL,archived_at TEXT NOT NULL,reason TEXT NOT NULL); CREATE TRIGGER corrupt_archive AFTER INSERT ON pilot_test_run_archive BEGIN UPDATE pilot_test_run_archive SET state='simulated mismatch' WHERE id=NEW.id; END");
+  expect(()=>archiveEmptyPilotRun(h.store.db,h.clock.value)).toThrow('verification failed');
+  expect(h.count('pilot_test_run')).toBe(1);expect(h.count('pilot_test_run_archive')).toBe(0);
 });

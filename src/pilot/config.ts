@@ -4,12 +4,12 @@ import { externalAuthPath } from '../whatsapp/auth-path.js';
 import { normalizePerson, parseGroups } from '../whatsapp/config.js';
 import { validateSavedSession } from './session.js';
 
-export async function pilotConfig(mode: 'pair' | 'live' | 'metadata' | 'one-shot' | 'configure', env: NodeJS.ProcessEnv = process.env, root = process.cwd()) {
+export async function pilotConfig(mode: 'pair' | 'live' | 'metadata' | 'one-shot' | 'configure' | 'sync', env: NodeJS.ProcessEnv = process.env, root = process.cwd()) {
   const requireFlag = (name: string) => { if (env[name] !== 'true') throw new Error(`Missing approval: ${name}`); };
   requireFlag('PILOT_OWNER_CONSENT');
   requireFlag('PILOT_AUTH_DIR_APPROVED');
   requireFlag('PILOT_AUTH_PERMISSIONS_CONFIRMED');
-  requireFlag(({ pair: 'PILOT_PAIRING_APPROVED', metadata: 'PILOT_METADATA_APPROVED', live: 'PILOT_LIVE_APPROVED', 'one-shot': 'PILOT_ONESHOT_APPROVED', configure: 'PILOT_CONFIG_APPROVED' })[mode]);
+  requireFlag(({ pair: 'PILOT_PAIRING_APPROVED', metadata: 'PILOT_METADATA_APPROVED', live: 'PILOT_LIVE_APPROVED', 'one-shot': 'PILOT_ONESHOT_APPROVED', configure: 'PILOT_CONFIG_APPROVED', sync:'PILOT_SYNC_APPROVED' })[mode]);
   if (env.WHATSAPP_ENABLE_LIVE !== (mode === 'live' ? 'true' : 'false')) throw new Error('Incorrect live messaging flag.');
   if (!env.LOCALAPPDATA || !isAbsolute(env.LOCALAPPDATA)) throw new Error('LOCALAPPDATA must be an absolute directory.');
   const expectedAuth = resolve(env.LOCALAPPDATA, 'AssignmentReminderBot/pilot-auth');

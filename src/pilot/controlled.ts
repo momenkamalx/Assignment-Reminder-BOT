@@ -9,6 +9,7 @@ import { messageId } from '../reminders/storage.js';
 import { PermanentDeliveryError } from '../delivery/engine.js';
 import { acceptsPilotDrafts, type PilotLimits } from './validation.js';
 import { diagnostic, noDiagnostics, type DiagnosticSink, type DiagnosticCode, type DiagnosticEvent } from '../diagnostics.js';
+import type { ReadinessSnapshot } from './readiness.js';
 
 export interface ControlledState {
   status: string; connected: boolean; listenerActive: boolean; outgoingLoopActive: boolean; overrideEnabled: boolean;
@@ -16,17 +17,21 @@ export interface ControlledState {
   lastTickAt?: string;
   adminSourceIds?: string[]; policySignature?: string;
   diagnostics?: Partial<Record<DiagnosticCode, number>>;
+  readiness?: ReadinessSnapshot;
 }
 export interface ControlledOptions extends PilotLimits {
+  diagnosticOnly?: boolean;
   maxPreviews?: number; maxFeedback?: number; resume?: boolean; diagnostics?: DiagnosticSink;
   reminder?: { scope: 'offline-test' | 'approved-pilot'; delayMs: 300000 };
 }
 type Kind = 'preview' | 'success' | 'list' | 'reminder' | 'feedback';
+export const pilotReminderLabel = ' تذكير تجريبي — اختبار البوت';
 export class ControlledTest {
   readonly adapter: BaileysAdapter;
   private worker: ReminderWorker;
   private queue: Promise<void> = Promise.resolve();
   private stopping = false;
+  private startedAtSeconds = 0;
   readonly state: ControlledState = { status: 'starting', connected: false, listenerActive: false, outgoingLoopActive: false, overrideEnabled: false };
   private diagnostics: DiagnosticSink;
   constructor(private store: Store, private group: GroupConfig, private aliases: Map<string, string>,
@@ -37,12 +42,12 @@ export class ControlledTest {
       this.state.diagnostics[event.code] = (this.state.diagnostics[event.code] ?? 0) + event.count;
       this.persist(); (options.diagnostics ?? noDiagnostics)(event);
     };
-    if ((options.reminder && (!['offline-test', 'approved-pilot'].includes(options.reminder.scope) || options.reminder.delayMs !== 300000)) ||
+    if ((options.diagnosticOnly && options.reminder) || (options.reminder && (!['offline-test', 'approved-pilot'].includes(options.reminder.scope) || options.reminder.delayMs !== 300000)) ||
         [options.maxPreviews ?? 32, options.maxFeedback ?? 8, options.maxAssignments ?? 1].some(value => !Number.isInteger(value) || value < 1)) throw new Error('Invalid explicit pilot policy.');
     if (!options.resume && (Number(db.prepare('SELECT COUNT(*) AS n FROM assignments').get()!.n) || Number(db.prepare('SELECT COUNT(*) AS n FROM outgoing_messages').get()!.n))) throw new Error('Controlled pilot requires empty assignment/outgoing storage.');
     db.exec(`CREATE TABLE IF NOT EXISTS pilot_test_run(id INTEGER PRIMARY KEY CHECK(id=1),state TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS pilot_test_sends(kind TEXT PRIMARY KEY,message_id TEXT NOT NULL UNIQUE,status TEXT NOT NULL,server_ack_at TEXT);`);
-    const signature = JSON.stringify({ group, maxAssignments: options.maxAssignments, allowedMethods: options.allowedMethods, maxPreviews: options.maxPreviews ?? 32, maxFeedback: options.maxFeedback ?? 8, reminder: options.reminder });
+    const signature = JSON.stringify({ group, maxAssignments: options.maxAssignments, allowedMethods: options.allowedMethods, maxPreviews: options.maxPreviews ?? 32, maxFeedback: options.maxFeedback ?? 8, reminder: options.reminder, diagnosticOnly: options.diagnosticOnly });
     const existing = db.prepare('SELECT state FROM pilot_test_run WHERE id=1').get();
     if (existing) {
       const saved = JSON.parse(existing.state as string) as ControlledState;
@@ -68,6 +73,7 @@ export class ControlledTest {
       else if (q?.text === text && q.kind === 'feedback' && this.state.adminSourceIds?.includes(q.reply_to as string)) kind = 'feedback';
       else if (db.prepare("SELECT id FROM reminder_jobs WHERE id=? AND message_id=? AND kind='reminder' AND offset_hours=0").get(this.state.reminderJobId ?? -1, id)) kind = 'reminder';
       if (!kind) throw new PermanentDeliveryError('pilot_send_blocked');
+      if (this.options.diagnosticOnly && kind !== 'preview' && kind !== 'feedback') throw new PermanentDeliveryError('pilot_diagnostic_send_blocked');
       const count = Number(db.prepare('SELECT COUNT(*) AS n FROM pilot_test_sends WHERE kind=? OR kind LIKE ?').get(kind, `${kind}:%`)!.n);
       const limit = kind === 'preview' ? this.options.maxPreviews ?? 32 : kind === 'feedback' ? this.options.maxFeedback ?? 8 : 1;
       const reservation = count ? `${kind}:${count + 1}` : kind;
@@ -77,7 +83,7 @@ export class ControlledTest {
       }
       catch { this.state.status = 'failed_no_retry'; this.persist(); throw new PermanentDeliveryError('pilot_duplicate_blocked'); }
       try {
-        const sent = await send(jid, text, reply, options); // Socket wrapper requires matching server ACK.
+        const sent = await send(jid, kind === 'reminder' ? `${text}\n${pilotReminderLabel}` : text, reply, options); // Socket wrapper requires matching server ACK.
         db.prepare("UPDATE pilot_test_sends SET status='accepted',server_ack_at=? WHERE kind=?").run(this.now(), reservation);
         this.notify(`${kind}: WhatsApp server acknowledged`); return sent;
       } catch {
@@ -90,6 +96,9 @@ export class ControlledTest {
   }
   private persist() { this.store.db.prepare('UPDATE pilot_test_run SET state=? WHERE id=1').run(JSON.stringify(this.state)); }
   observe(event: DiagnosticEvent) { diagnostic(this.diagnostics, event.code, event.count); }
+  observeReadiness(readiness: ReadinessSnapshot) {
+    if (JSON.stringify(this.state.readiness) !== JSON.stringify(readiness)) { this.state.readiness = readiness; this.persist(); }
+  }
   private saved() { return this.store.db.prepare('SELECT id,group_id,data,registered_at,version FROM assignments').all(); }
   private serialize(work: () => Promise<void>) {
     const task = this.queue.then(async () => { if (!this.stopping) await work(); });
@@ -98,32 +107,46 @@ export class ControlledTest {
   }
   start(socket: Socket) {
     this.adapter.attach(socket, true);
+    this.startedAtSeconds = Math.floor(Date.parse(this.now()) / 1000);
     Object.assign(this.state, { status: this.state.announcementId ? this.state.status : 'waiting_for_announcement', connected: true, listenerActive: true, outgoingLoopActive: true }); this.persist();
   }
-  receive(event: BaileysEventMap['messages.upsert']) { return this.serialize(async () => {
-    if (!this.state.connected || event.type !== 'notify') return;
+  receive(event: BaileysEventMap['messages.upsert']) {
+    diagnostic(this.diagnostics, 'upsert_received');
+    diagnostic(this.diagnostics, event.type === 'notify' ? 'upsert_notify' : event.type === 'append' ? 'upsert_append' : 'upsert_other');
+    return this.serialize(async () => {
+    if (!this.state.connected) { diagnostic(this.diagnostics, 'upsert_disconnected'); return; }
+    if (event.type !== 'notify') return; // History stays rejected regardless of timestamp.
     for (const raw of event.messages) {
+      if (!raw?.key || typeof raw.key.remoteJid !== 'string') { diagnostic(this.diagnostics, 'message_key_invalid'); continue; }
       if (raw.key.remoteJid !== this.group.id) { diagnostic(this.diagnostics, 'group_rejected'); continue; }
-      if (raw.key.fromMe || !raw.key.id || !raw.key.participant) continue;
+      diagnostic(this.diagnostics, 'pilot_message_received'); diagnostic(this.diagnostics, 'pilot_group_matched');
+      if (raw.key.fromMe) { diagnostic(this.diagnostics, 'self_message_rejected'); continue; }
+      if (typeof raw.key.id !== 'string' || !raw.key.id || typeof raw.key.participant !== 'string' || !raw.key.participant ||
+          (raw.key.participantAlt != null && typeof raw.key.participantAlt !== 'string')) { diagnostic(this.diagnostics, 'message_key_invalid'); continue; }
+      const timestamp = raw.messageTimestamp == null ? null : Number(raw.messageTimestamp);
+      diagnostic(this.diagnostics, timestamp === null ? 'timestamp_missing' : !Number.isFinite(timestamp) || timestamp <= 0 || timestamp > 1e12 ? 'timestamp_invalid' : timestamp < this.startedAtSeconds ? 'timestamp_before_start' : 'timestamp_since_start');
       const identities = [raw.key.participant, raw.key.participantAlt].filter((id): id is string => !!id).map(jidNormalizedUser);
       const roles = [...new Set(identities.map(id => this.aliases.get(id)).filter((id): id is string => !!id))];
-      if (roles.length !== 1) { diagnostic(this.diagnostics, 'message_received'); diagnostic(this.diagnostics, 'group_matched'); diagnostic(this.diagnostics, 'leader_rejected'); continue; }
+      if (roles.length !== 1) { diagnostic(this.diagnostics, roles.length ? 'sender_conflict' : 'sender_unresolved'); diagnostic(this.diagnostics, 'leader_rejected'); continue; }
+      diagnostic(this.diagnostics, 'sender_resolved');
       const role = roles[0]!;
+      diagnostic(this.diagnostics, role === this.group.leader ? 'pilot_leader_matched' : 'pilot_leader_rejected');
       const content = normalizeMessageContent(raw.message);
       const text = (content?.conversation ?? content?.extendedTextMessage?.text ?? '').trim();
       const quote = content?.extendedTextMessage?.contextInfo?.stanzaId;
       let permit = false;
-      if (text === '!list' && this.saved().length > 0 && !this.state.listSourceId) { this.state.listSourceId = raw.key.id; permit = true; }
+      if (!this.options.diagnosticOnly && text === '!list' && this.saved().length > 0 && !this.state.listSourceId) { this.state.listSourceId = raw.key.id; permit = true; }
       else if (role === this.group.leader && !quote && !this.state.announcementId) {
+        diagnostic(this.diagnostics, 'pilot_parser_invoked');
         const drafts = extractAssignments(text, this.group.timezone);
         if (acceptsPilotDrafts(drafts, this.options)) {
           this.state.announcementId = raw.key.id; permit = true;
         } else diagnostic(this.diagnostics, drafts.length ? 'pilot_limit_rejected' : 'parser_empty', drafts.length);
-      } else if (this.group.admins.includes(role) && (/^(نعم|يس|yes|y|لا|no)$/iu.test(text) || text.startsWith('!edit ')) && quote && this.saved().length === 0 &&
+      } else if (this.group.admins.includes(role) && ((!this.options.diagnosticOnly && /^(نعم|يس|yes|y|لا|no)$/iu.test(text)) || text.startsWith('!edit ')) && quote && this.saved().length === 0 &&
           this.store.confirmation(this.group.id, quote, this.now())) {
         this.state.adminSourceIds = [...new Set([...(this.state.adminSourceIds ?? []), raw.key.id])]; permit = true;
       } else if (role === this.group.leader && quote && !text.startsWith('!')) diagnostic(this.diagnostics, 'quoted_announcement_rejected');
-      if (!permit) continue;
+      if (!permit) { diagnostic(this.diagnostics, 'pilot_message_ignored'); continue; }
       this.persist();
       // Add only previously verified phone/LID alias; retain the original quote-author identity.
       const enriched: WAMessage = { ...raw, key: { ...raw.key, participantAlt: role } };
@@ -134,6 +157,7 @@ export class ControlledTest {
   private async afterActivity() {
     if (this.state.status === 'failed_no_retry') { this.finish(); return; }
     const rows = this.saved();
+    if (this.options.diagnosticOnly && rows.length) throw new Error('Diagnostic pilot cannot register assignments.');
     if (!rows.length && this.store.db.prepare("SELECT kind FROM pilot_test_sends WHERE kind='preview' AND status='accepted'").get()) { this.state.status = 'waiting_for_admin'; this.persist(); }
     if ((this.options.maxAssignments !== undefined && rows.length > this.options.maxAssignments) || rows.some(row => row.group_id !== this.group.id)) throw new Error('Pilot assignment isolation failed.');
     if (rows.length > 0 && !this.state.assignmentId) {

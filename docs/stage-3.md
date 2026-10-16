@@ -2,6 +2,8 @@
 
 Everything in this stage was built and tested offline. No real account was paired, no live messages were sent, and nothing was deployed. Stage 4 is still pending. No Git commit or push is made without explicit permission; the user must also supply the exact commit name.
 
+The subsequent [outgoing-message reliability update](outgoing-reliability.md) adds durable previews, success replies and feedback, shared bounded retries, failure inspection and recovery. Its retry policy and readiness assessment supersede the earlier delivery-limit notes below.
+
 ## Safe local testing
 
 ```powershell

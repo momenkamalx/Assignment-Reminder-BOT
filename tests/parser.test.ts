@@ -1,8 +1,26 @@
 import { describe, expect, it } from 'vitest';
 import { extractAssignments, parseDeadline } from '../src/parser.js';
 import { expectedAssignments, missingDeadlineAnnouncement, sudaneseAnnouncement } from './fixtures/sudanese-announcement.js';
+import { pilotAnnouncement } from './fixtures/pilot-announcement.js';
 
 describe('conservative assignment extraction', () => {
+  it('keeps the exact pilot announcement together across blank lines', () => {
+    expect(extractAssignments(pilotAnnouncement)).toMatchObject([{course:'Computer Networks',name:'Assignment 3 – Network Protocols',deadline:'2026-10-20T21:59:00.000Z',deadlineIssue:null,submissionMethod:'SUST Moodle',destination:'SUST Moodle.'}]);
+    expect(extractAssignments(pilotAnnouncement)).toHaveLength(1);
+  });
+  it('preserves three real assignments with blank lines between their fields and distinct destinations', () => {
+    expect(extractAssignments(sudaneseAnnouncement.replaceAll('\n','\n\n'))).toEqual(expectedAssignments);
+  });
+  it('keeps blank-line fields together when a deadline still needs correction', () => {
+    expect(extractAssignments(pilotAnnouncement.replace('20 أكتوبر 2026 الساعة 11:59 مساءً بتوقيت السودان','بكرة'))).toMatchObject([{course:'Computer Networks',name:'Assignment 3 – Network Protocols',deadline:null,deadlineIssue:expect.any(String),submissionMethod:'SUST Moodle'}]);
+    expect(extractAssignments(pilotAnnouncement.replace('20 أكتوبر 2026 الساعة 11:59 مساءً بتوقيت السودان','بكرة'))).toHaveLength(1);
+  });
+  it.each([
+    ['20 أكتوبر 2026 الساعة 12:00 صباحاً بتوقيت السودان','2026-10-19T22:00:00.000Z'],
+    ['20 أكتوبر 2026 الساعة 12:00 مساءً بتوقيت السودان','2026-10-20T10:00:00.000Z'],
+    ['٢٠ أكتوبر ٢٠٢٦ الساعة ١١:٥٩ مساءً بتوقيت السودان','2026-10-20T21:59:00.000Z'],
+  ])('converts explicit Arabic date safely: %s', (text,deadline) => expect(parseDeadline(text).deadline).toBe(deadline));
+  it.each(['20 أكتوبر الساعة 11:59 مساءً','20 أكتوبر 2026 الساعة 13:59 مساءً','31 فبراير 2026 الساعة 11:59 مساءً','20 أكتوبر 2026 الساعة 11:99 مساءً','20 أكتوبر 2026 الساعة 11:59 مساءً أو 2026-10-21 18:00','20 أكتوبر 2026 الساعة 11:59 مساءً أو 21 أكتوبر','20 أكتوبر 2026 الساعة 11:59 مساءً أو 21 أكتوبر 2026 الساعة 11:59 مساءً'])('does not guess invalid or ambiguous Arabic dates: %s', text=>expect(parseDeadline(text).deadline).toBeNull());
   it('extracts three Sudanese Arabic assignments with separate subjects, UTC deadlines and destinations', () => {
     expect(extractAssignments(sudaneseAnnouncement)).toEqual(expectedAssignments);
   });

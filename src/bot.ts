@@ -112,6 +112,7 @@ export class Bot {
     // Replies and commands are never treated as new leader announcements.
     if (m.replyTo || text.startsWith('!') || m.senderId !== group.leader) return;
     diagnostic(this.diagnostics, hasAssignmentKeyword(text) ? 'keyword_detected' : 'keyword_absent');
+    diagnostic(this.diagnostics, 'parser_invoked');
     const drafts = extractAssignments(text, group.timezone);
     diagnostic(this.diagnostics, !drafts.length ? 'parser_empty' : drafts.some(d => !d.course || !d.name || !d.deadline || d.deadlineIssue || !d.submissionMethod) ? 'parser_incomplete' : 'parser_accepted', drafts.length);
     if (drafts.length && this.store.queueAnnouncement(m, drafts, preview(drafts, group.timezone), this.now(), receipt)) {
